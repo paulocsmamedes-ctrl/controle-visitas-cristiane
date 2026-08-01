@@ -1030,7 +1030,7 @@ const ICONS = {
 
     agendaEvents = events;
     agendaSyncedAt = Date.now();
-    nextAutoSyncAt = agendaSyncedAt + 30*60*1000;
+    nextAutoSyncAt = agendaSyncedAt + 10*60*1000;
     storageSet(AGENDA_KEY, JSON.stringify({events: agendaEvents, syncedAt: agendaSyncedAt}));
     const importResult = await importGoogleEventsIntoVisits(events);
     importResult.calendars = calendarIds.length;
@@ -1901,7 +1901,7 @@ const ICONS = {
         ${activeTab === 'agenda' ? `
           <div class="card">
             <h3>${ICONS.calendar} Sincronização Google Agenda</h3>
-            <p class="sub">Importação automática dos compromissos de visita da sua conta do Google (2025-2035). Conecte uma vez e a atualização continua sozinha a cada 30 minutos, inclusive depois de fechar e abrir a página de novo.${gcalAccessToken ? ` <span id="sync-countdown" class="sync-countdown"></span>` : ''}</p>
+            <p class="sub">Importação automática dos compromissos de visita da sua conta do Google (2025-2035). Conecte uma vez e a atualização continua sozinha a cada 10 minutos, inclusive depois de fechar e abrir a página de novo.${gcalAccessToken ? ` <span id="sync-countdown" class="sync-countdown"></span>` : ''}</p>
 
             <div class="sync-row">
               <button type="button" class="btn-outline" id="btn-sync-agenda" ${syncStatus.loading?'disabled':''}>
