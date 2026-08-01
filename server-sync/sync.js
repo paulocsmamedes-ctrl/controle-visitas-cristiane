@@ -97,7 +97,7 @@ async function fetchGoogleEvents(accessToken) {
     const hora = (ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }) : '';
     events.push({ id: ev.id, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '' });
   });
-  return events;
+  return { events, calendarsCount: calendarIds.length };
 }
 
 async function importGoogleEventsIntoVisits(db, events) {
@@ -156,7 +156,7 @@ async function importGoogleEventsIntoVisits(db, events) {
     await batch.commit();
   }
 
-  return { imported, updated, skipped, removed, totalEvents: events.length, calendars: undefined };
+  return { imported, updated, skipped, removed, totalEvents: events.length };
 }
 
 async function main() {
@@ -165,8 +165,9 @@ async function main() {
   const db = admin.firestore();
 
   const accessToken = await getFreshAccessToken();
-  const events = await fetchGoogleEvents(accessToken);
+  const { events, calendarsCount } = await fetchGoogleEvents(accessToken);
   const result = await importGoogleEventsIntoVisits(db, events);
+  result.calendars = calendarsCount;
 
   await db.collection('meta').doc('googleSync').set({
     lastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
