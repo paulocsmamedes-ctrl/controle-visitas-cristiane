@@ -876,6 +876,8 @@ const ICONS = {
   }
   let agendaEvents = [];
   let agendaSyncedAt = null;
+  let serverSyncedAt = null;
+  let serverLastImport = null;
   let syncStatus = { loading:false, error:null };
   let showGcalSettings = false;
   let gcalClientId = '';
@@ -938,6 +940,14 @@ const ICONS = {
         visitsError = 'Não foi possível sincronizar com o banco compartilhado: '+err.message;
         render();
       });
+      onSnapshot(doc(db,'meta','googleSync'), (snap)=>{
+        const data = snap.data();
+        if(data && data.lastSyncedAt){
+          serverSyncedAt = data.lastSyncedAt.toDate ? data.lastSyncedAt.toDate().getTime() : new Date(data.lastSyncedAt).getTime();
+          serverLastImport = data.lastImport || null;
+          render();
+        }
+      }, ()=>{});
     });
   }
 
@@ -1095,10 +1105,16 @@ const ICONS = {
     return { imported, updated, skipped, removed };
   }
 
+  function latestSyncedAt(){
+    if(serverSyncedAt && (!agendaSyncedAt || serverSyncedAt > agendaSyncedAt)) return serverSyncedAt;
+    return agendaSyncedAt;
+  }
+
   function syncSummaryText(){
-    if(!agendaSyncedAt) return 'Ainda não sincronizado.';
-    let text = 'Última sincronização: '+new Date(agendaSyncedAt).toLocaleString('pt-BR');
-    const r = syncStatus.lastImport;
+    const effective = latestSyncedAt();
+    if(!effective) return 'Ainda não sincronizado.';
+    let text = 'Última sincronização: '+new Date(effective).toLocaleString('pt-BR');
+    const r = (effective === serverSyncedAt && effective !== agendaSyncedAt) ? serverLastImport : syncStatus.lastImport;
     if(r){
       const scan = [];
       if(r.calendars!=null) scan.push(r.calendars+' calendário(s)');
@@ -1901,7 +1917,7 @@ const ICONS = {
         ${activeTab === 'agenda' ? `
           <div class="card">
             <h3>${ICONS.calendar} Sincronização Google Agenda</h3>
-            <p class="sub">Importação automática dos compromissos de visita da sua conta do Google (2025-2035). Conecte uma vez e a atualização continua sozinha a cada 10 minutos, inclusive depois de fechar e abrir a página de novo.${gcalAccessToken ? ` <span id="sync-countdown" class="sync-countdown"></span>` : ''}</p>
+            <p class="sub">Importação automática dos compromissos de visita da sua conta do Google (2025-2035). Conecte uma vez e a atualização continua sozinha a cada 10 minutos, inclusive depois de fechar e abrir a página de novo.${latestSyncedAt() ? ` <span id="sync-countdown" class="sync-countdown"></span>` : ''}</p>
 
             <div class="sync-row">
               <button type="button" class="btn-outline" id="btn-sync-agenda" ${syncStatus.loading?'disabled':''}>
@@ -1912,7 +1928,8 @@ const ICONS = {
               <button type="button" class="btn-ghost" id="btn-toggle-gcal-settings">${showGcalSettings?'Ocultar Configuração':'Configurar OAuth Client ID'}</button>
             </div>
             
-            <span class="sync-status ${syncStatus.error?'err':''}">${syncStatus.error ? syncStatus.error : (syncStatus.notice ? syncStatus.notice : syncSummaryText())}</span>
+            ${(syncStatus.error || syncStatus.notice) ? `<span class="sync-status ${syncStatus.error?'err':''}">${syncStatus.error || syncStatus.notice}</span>` : ''}
+            <span class="sync-status">${syncSummaryText()}</span>
 
             <div class="agenda-filters">
               <select id="agenda-f-year">
@@ -2364,8 +2381,10 @@ const ICONS = {
   function updateSyncCountdown(){
     const el = document.getElementById('sync-countdown');
     if(!el) return;
-    if(!gcalAccessToken || !nextAutoSyncAt){ el.textContent = ''; return; }
-    const msLeft = nextAutoSyncAt - Date.now();
+    const anchor = (gcalAccessToken && nextAutoSyncAt) ? nextAutoSyncAt - 10*60*1000 : latestSyncedAt();
+    if(!anchor){ el.textContent = ''; return; }
+    const next = anchor + 10*60*1000;
+    const msLeft = next - Date.now();
     if(msLeft <= 0){ el.textContent = 'Atualizando agora...'; return; }
     const totalSeconds = Math.max(0, Math.ceil(msLeft / 1000) - 1);
     const minutes = Math.floor(totalSeconds / 60);
