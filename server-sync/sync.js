@@ -107,7 +107,8 @@ async function importGoogleEventsIntoVisits(db, events) {
 
   let imported = 0, updated = 0, skipped = 0, removed = 0;
 
-  const toRemove = visits.filter(v => v.fromGoogle && !normalizeText(v.imovel).includes('visita'));
+  const currentEventIds = new Set(events.map(ev => ev.id));
+  const toRemove = visits.filter(v => v.fromGoogle && (!normalizeText(v.imovel).includes('visita') || (v.sourceId && !currentEventIds.has(v.sourceId))));
   const removeIds = new Set(toRemove.map(v => v.id));
   const remaining = visits.filter(v => !removeIds.has(v.id));
 
