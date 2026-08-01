@@ -1,0 +1,29 @@
+name: Sincronizar Google Agenda
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # a cada 30 minutos, independente de navegador aberto
+  workflow_dispatch: {}       # permite rodar manualmente pela aba Actions do GitHub, para testar
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependências
+        working-directory: server-sync
+        run: npm install --omit=dev
+
+      - name: Rodar sincronização
+        working-directory: server-sync
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: npm run sync

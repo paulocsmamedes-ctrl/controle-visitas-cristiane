@@ -1,0 +1,12 @@
+{
+  "name": "gcal-sync",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "get-refresh-token": "node get-refresh-token.js",
+    "sync": "node sync.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.6.0"
+  }
+}
