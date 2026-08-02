@@ -2388,8 +2388,8 @@ const ICONS = {
       await requestGoogleToken('');
       await fetchGoogleEvents();
     }catch(e){
-      syncStatus = { loading:false, error:null, notice: 'Não consegui reconectar automaticamente ao Google Agenda. Clique em "Conectar Google Agenda" para reativar a sincronização automática.' };
-      render();
+      // Sincronização automática já roda no servidor (GitHub Actions), independente
+      // desta aba reconectar ou não — por isso essa falha silenciosa não precisa de aviso.
     }
   }
 
