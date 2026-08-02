@@ -411,11 +411,13 @@
   .sync-status.err { color: var(--danger); font-weight: 600; }
   .sync-countdown { font-weight: 600; color: var(--accent); }
   .agenda-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
-  .agenda-filters select {
+  .agenda-filters input, .agenda-filters select {
     font-family: inherit; border: 1px solid var(--card-border); background: var(--card);
     padding: 7px 12px; border-radius: 20px; font-size: 12.5px; color: var(--ink); cursor: pointer; font-weight: 600;
   }
-  .agenda-filters select:hover { border-color: var(--accent); }
+  .agenda-filters input { cursor: text; flex: 1; min-width: 200px; font-weight: 500; }
+  .agenda-filters input:hover, .agenda-filters select:hover, .agenda-filters input:focus, .agenda-filters select:focus { border-color: var(--accent); outline: none; }
+  .agenda-filters select:disabled { opacity: .5; cursor: not-allowed; }
   .agenda-list { display: flex; flex-direction: column; gap: 10px; }
   .agenda-item {
     display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
@@ -845,7 +847,7 @@ const ICONS = {
   let justStampedId = null;
   let ioMessage = null;
   let filters = { q:'', status:'', year:'', granularity:'mes', periodValue:'' };
-  let agendaFilters = { year:'', granularity:'mes', periodValue:'' };
+  let agendaFilters = { q:'', year:'', granularity:'mes', periodValue:'' };
   
   const MONTH_NAMES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
   const PERIOD_GROUPS = {
@@ -854,8 +856,10 @@ const ICONS = {
     semestre: [[1,2,3,4,5,6],[7,8,9,10,11,12]]
   };
   const PERIOD_LABELS = { mes:'Mês', bimestre:'Bimestre', trimestre:'Trimestre', semestre:'Semestre' };
+  const PERIOD_ALL_LABELS = { '':'Todos os períodos', mes:'Todos os meses', bimestre:'Todos os bimestres', trimestre:'Todos os trimestres', semestre:'Todos os semestres' };
 
   function monthsForPeriod(granularity, value){
+    if(!granularity) return null;
     if(!value || value==='nenhum') return null;
     if(granularity==='mes') return [Number(value)];
     const groups = PERIOD_GROUPS[granularity];
@@ -864,6 +868,7 @@ const ICONS = {
   }
 
   function periodValueOptions(granularity){
+    if(!granularity) return [];
     if(granularity==='mes'){
       return MONTH_NAMES.map((name,i)=>({ value:String(i+1).padStart(2,'0'), label:name }));
     }
@@ -1631,6 +1636,11 @@ const ICONS = {
           const evMonth = ev.data ? Number(ev.data.slice(5,7)) : null;
           if(!evMonth || !agendaPeriodMonths.includes(evMonth)) return false;
         }
+        if(agendaFilters.q){
+          const q = agendaFilters.q.toLowerCase();
+          const hay = (ev.titulo+' '+(ev.local||'')).toLowerCase();
+          if(!hay.includes(q)) return false;
+        }
         return true;
       })
       .slice()
@@ -1932,16 +1942,18 @@ const ICONS = {
             <span class="sync-status">${syncSummaryText()}</span>
 
             <div class="agenda-filters">
+              <input id="agenda-f-q" type="text" placeholder="Buscar assunto na agenda..." value="${escapeHtml(agendaFilters.q)}" />
               <select id="agenda-f-year">
-                <option value="">Todos os anos</option>
+                <option value="">Todos os Anos</option>
                 <option value="nenhum" ${agendaFilters.year==='nenhum'?'selected':''}>Nenhum</option>
                 ${Array.from({length:11},(_,i)=>2025+i).map(y=>`<option value="${y}" ${agendaFilters.year===String(y)?'selected':''}>${y}</option>`).join('')}
               </select>
               <select id="agenda-f-granularity">
+                <option value="" ${agendaFilters.granularity===''?'selected':''}>Todos os períodos</option>
                 ${Object.keys(PERIOD_LABELS).map(g=>`<option value="${g}" ${agendaFilters.granularity===g?'selected':''}>${PERIOD_LABELS[g]}</option>`).join('')}
               </select>
-              <select id="agenda-f-period-value">
-                <option value="">Todos(as)</option>
+              <select id="agenda-f-period-value" ${agendaFilters.granularity===''?'disabled':''}>
+                <option value="">${PERIOD_ALL_LABELS[agendaFilters.granularity] || 'Todos os períodos'}</option>
                 <option value="nenhum" ${agendaFilters.periodValue==='nenhum'?'selected':''}>Nenhum</option>
                 ${periodValueOptions(agendaFilters.granularity).map(o=>`<option value="${o.value}" ${agendaFilters.periodValue===o.value?'selected':''}>${o.label}</option>`).join('')}
               </select>
@@ -2272,6 +2284,9 @@ const ICONS = {
 
     const changePassBtn = document.getElementById('btn-change-gcal-pass');
     if(changePassBtn) changePassBtn.addEventListener('click', changeGcalPassword);
+
+    const agendaQSel = document.getElementById('agenda-f-q');
+    if(agendaQSel) agendaQSel.addEventListener('input', (e)=>{ agendaFilters.q = e.target.value; render(); });
 
     const agendaYearSel = document.getElementById('agenda-f-year');
     if(agendaYearSel) agendaYearSel.addEventListener('change', (e)=>{ agendaFilters.year = e.target.value; render(); });
