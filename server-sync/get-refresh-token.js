@@ -21,7 +21,12 @@ const OUTPUT_FILE = path.join(__dirname, '.refresh-token.secret');
 
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const SCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
+// LEITURA + ESCRITA. O `calendar.events` é o que permite ao sync.js gravar de volta
+// no Google Agenda (alteração, criação e exclusão de compromissos); o `calendar.readonly`
+// continua necessário para listar os calendários da conta.
+// Se você já tinha um refresh token só de leitura, ele NÃO serve mais — precisa gerar
+// outro rodando este script de novo e atualizar o GitHub Secret GOOGLE_REFRESH_TOKEN.
+const SCOPE = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly';
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
   console.error('Defina GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET como variáveis de ambiente antes de rodar este script.');

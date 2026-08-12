@@ -410,6 +410,13 @@
   .sync-status { font-size: 12px; color: var(--ink-soft); line-height: 1.5; display: block; margin-bottom: 14px; }
   .sync-status.err { color: var(--danger); font-weight: 600; }
   .sync-countdown { font-weight: 600; color: var(--accent); }
+  .gcal-badge {
+    display: inline-flex; align-items: center; gap: 4px; vertical-align: middle;
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; font-weight: 600;
+    padding: 2px 7px; border-radius: 20px; white-space: nowrap; cursor: help;
+  }
+  .gcal-badge.pending { color: var(--warn-dark); background: var(--warn-soft); border: 1px solid rgba(251,191,36,.3); }
+  .gcal-badge.err { color: var(--danger-dark); background: var(--danger-soft); border: 1px solid rgba(248,113,113,.3); }
   .agenda-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
   .agenda-filters input, .agenda-filters select {
     font-family: inherit; border: 1px solid var(--card-border); background: var(--card);
@@ -779,11 +786,29 @@ const ICONS = {
   bairroDropdownEl.className = 'bairro-dropdown';
   document.body.appendChild(bairroDropdownEl);
   let activeBairroInput = null;
+  let bairroActiveIndex = -1;
 
   function closeAllBairroDropdowns(){
     bairroDropdownEl.classList.remove('open');
     bairroDropdownEl.innerHTML = '';
     activeBairroInput = null;
+    bairroActiveIndex = -1;
+  }
+
+  function highlightBairroOption(idx){
+    const opts = bairroDropdownEl.querySelectorAll('.bairro-option');
+    if(!opts.length) return;
+    bairroActiveIndex = ((idx % opts.length) + opts.length) % opts.length;
+    opts.forEach((o,i)=> o.classList.toggle('active', i===bairroActiveIndex));
+    opts[bairroActiveIndex].scrollIntoView({block:'nearest'});
+  }
+
+  function selectBairroOption(opt){
+    if(!opt || !activeBairroInput) return;
+    const input = activeBairroInput;
+    input.value = opt.getAttribute('data-value');
+    closeAllBairroDropdowns();
+    input.dispatchEvent(new Event('change', {bubbles:true}));
   }
 
   function renderBairroDropdown(input){
@@ -797,16 +822,15 @@ const ICONS = {
     bairroDropdownEl.style.minWidth = Math.round(rect.width) + 'px';
     bairroDropdownEl.classList.add('open');
     activeBairroInput = input;
+    bairroActiveIndex = -1;
+    if(matches.length) highlightBairroOption(0);
   }
 
   bairroDropdownEl.addEventListener('mousedown', (e)=>{
     const opt = e.target.closest('.bairro-option');
     if(!opt || !activeBairroInput) return;
     e.preventDefault();
-    const input = activeBairroInput;
-    input.value = opt.getAttribute('data-value');
-    closeAllBairroDropdowns();
-    input.dispatchEvent(new Event('change', {bubbles:true}));
+    selectBairroOption(opt);
   });
   const STATUS_STYLE_LIGHT = {
     'Agendada':        {bg:'#FFFBEB', fg:'#D97706'},
@@ -883,6 +907,11 @@ const ICONS = {
   let agendaSyncedAt = null;
   let serverSyncedAt = null;
   let serverLastImport = null;
+  let serverWriteScopeError = null;
+  // Eventos cuja exclusão já foi pedida aqui mas que o servidor ainda não apagou no
+  // Google. Enquanto o rastro existir, o evento não pode ser reimportado — senão a
+  // visita excluída reaparece até o próximo ciclo do servidor.
+  let pendingDeletionIds = new Set();
   let syncStatus = { loading:false, error:null };
   let showGcalSettings = false;
   let gcalClientId = '';
@@ -945,11 +974,17 @@ const ICONS = {
         visitsError = 'Não foi possível sincronizar com o banco compartilhado: '+err.message;
         render();
       });
+      onSnapshot(collection(db,'googleDeletions'), (snap)=>{
+        const antes = pendingDeletionIds.size;
+        pendingDeletionIds = new Set(snap.docs.map(d=>d.id));
+        if(pendingDeletionIds.size !== antes) render();
+      }, ()=>{});
       onSnapshot(doc(db,'meta','googleSync'), (snap)=>{
         const data = snap.data();
         if(data && data.lastSyncedAt){
           serverSyncedAt = data.lastSyncedAt.toDate ? data.lastSyncedAt.toDate().getTime() : new Date(data.lastSyncedAt).getTime();
           serverLastImport = data.lastImport || null;
+          serverWriteScopeError = data.writeScopeError || null;
           render();
         }
       }, ()=>{});
@@ -1028,19 +1063,21 @@ const ICONS = {
   async function fetchGoogleEvents(){
     const calendarIds = await fetchCalendarIds();
     const rawByCalendar = await Promise.all(
-      calendarIds.map(id => fetchEventsFromCalendar(id).catch(()=>[]))
+      calendarIds.map(id => fetchEventsFromCalendar(id).then(list=>({id, list})).catch(()=>({id, list:[]})))
     );
 
     const seen = new Set();
     const events = [];
-    rawByCalendar.flat().forEach(ev=>{
-      if(!ev.id || seen.has(ev.id)) return;
-      seen.add(ev.id);
-      const start = ev.start && (ev.start.dateTime || ev.start.date);
-      const iso = start ? start.slice(0,10) : '';
-      if(!iso) return;
-      const hora = (ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) : '';
-      events.push({ id: ev.id, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '' });
+    rawByCalendar.forEach(({id: calendarId, list})=>{
+      list.forEach(ev=>{
+        if(!ev.id || seen.has(ev.id)) return;
+        seen.add(ev.id);
+        const start = ev.start && (ev.start.dateTime || ev.start.date);
+        const iso = start ? start.slice(0,10) : '';
+        if(!iso) return;
+        const hora = (ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'}) : '';
+        events.push({ id: ev.id, calendarId, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '' });
+      });
     });
 
     agendaEvents = events;
@@ -1062,8 +1099,20 @@ const ICONS = {
     const today = todayISO();
     let imported = 0, updated = 0, skipped = 0, removed = 0;
 
+    // ATENÇÃO: esta função é a cópia-espelho de importGoogleEventsIntoVisits() em
+    // server-sync/sync.js. Qualquer correção aqui precisa ser feita lá também, no mesmo
+    // commit — senão o comportamento muda conforme quem sincronizou por último.
+    const eventById = new Map(events.map(ev=>[ev.id, ev]));
     const currentEventIds = new Set(events.map(ev=>ev.id));
-    const toRemove = visits.filter(v => v.fromGoogle && (!normalizeText(v.imovel).includes('visita') || (v.sourceId && !currentEventIds.has(v.sourceId))));
+
+    const toRemove = visits.filter(v => {
+      if(!v.fromGoogle || !v.sourceId) return false;   // visitas nascidas no CRM não são removidas pelo sync
+      if(v.pendingGoogleSync) return false;            // tem alteração local esperando envio ao Google
+      if(!currentEventIds.has(v.sourceId)) return true; // o evento sumiu da agenda
+      const ev = eventById.get(v.sourceId);
+      // O evento existe, mas foi renomeado para algo que não é mais uma visita.
+      return !!ev && !normalizeText(ev.titulo).includes('visita');
+    });
     const removeIds = new Set(toRemove.map(v=>v.id));
     const remaining = visits.filter(v => !removeIds.has(v.id));
 
@@ -1072,18 +1121,31 @@ const ICONS = {
 
     events.forEach(ev=>{
       if(!ev.data) return;
+      if(pendingDeletionIds.has(ev.id)) return;  // exclusão pedida, aguardando o servidor apagar
       const isVisita = normalizeText(ev.titulo).includes('visita');
       if(!isVisita){ skipped++; return; }
       const existing = remaining.find(v=>v.sourceId===ev.id);
       if(existing){
-        if(existing.status==='Agendada' && ev.data < today){
-          ops.push({type:'update', id:existing.id, data:{status:'Realizada'}});
+        if(existing.pendingGoogleSync) return;  // alteração local ainda não enviada: não sobrescreve
+        const patch = {};
+        if(ev.data !== existing.data) patch.data = ev.data;
+        if(ev.titulo && ev.titulo !== existing.imovel) patch.imovel = ev.titulo;
+        // só sobrescreve o bairro se o Google tem valor — nunca apaga o que foi preenchido no CRM
+        if(ev.local && ev.local !== existing.bairro) patch.bairro = ev.local;
+        if(!existing.calendarId && ev.calendarId) patch.calendarId = ev.calendarId;
+
+        const dataFinal = patch.data || existing.data;
+        if(existing.status==='Agendada' && dataFinal < today) patch.status = 'Realizada';
+
+        if(Object.keys(patch).length){
+          ops.push({type:'update', id:existing.id, data:patch});
           updated++;
         }
         return;
       }
       ops.push({type:'set', id:uid(), data:{
         sourceId: ev.id,
+        calendarId: ev.calendarId,
         fromGoogle: true,
         data: ev.data,
         imovel: ev.titulo,
@@ -1114,6 +1176,12 @@ const ICONS = {
     if(serverSyncedAt && (!agendaSyncedAt || serverSyncedAt > agendaSyncedAt)) return serverSyncedAt;
     return agendaSyncedAt;
   }
+
+  // Toda alteração feita aqui no CRM marca a visita para ser gravada de volta no Google
+  // Agenda pelo sync do servidor (GitHub Actions), no próximo ciclo — em até 10 minutos.
+  // O navegador não escreve no Google direto: ele só tem permissão de leitura, e a conexão
+  // OAuth desta aba é justamente a parte que falha ao reabrir a página.
+  const PENDING_GCAL = { pendingGoogleSync: true };
 
   function syncSummaryText(){
     const effective = latestSyncedAt();
@@ -1333,7 +1401,7 @@ const ICONS = {
 
   async function clearFollowup(id){
     try{
-      await updateDoc(doc(db,'visits',id), {followup:''});
+      await updateDoc(doc(db,'visits',id), {followup:'', ...PENDING_GCAL});
     }catch(e){
       alert('Não foi possível atualizar: '+e.message);
     }
@@ -1598,14 +1666,20 @@ const ICONS = {
   function render(){
     const active = document.activeElement;
     const activeId = active && active.id;
+    const activeDataId = active && active.getAttribute && active.getAttribute('data-id');
+    const activeFirstClass = active && active.className ? active.className.split(' ')[0] : null;
     let selStart = null, selEnd = null, activeValue = null;
     const isFormField = active && (active.tagName==='INPUT' || active.tagName==='TEXTAREA' || active.tagName==='SELECT');
-    if(active && activeId && isFormField){
+    if(active && (activeId || activeDataId) && isFormField){
       activeValue = active.value;
       if(typeof active.selectionStart === 'number'){
         selStart = active.selectionStart; selEnd = active.selectionEnd;
       }
     }
+
+    const tableScrollBefore = document.getElementById('table-scroll');
+    const savedTableScrollTop = tableScrollBefore ? tableScrollBefore.scrollTop : null;
+    const savedTableScrollLeft = tableScrollBefore ? tableScrollBefore.scrollLeft : null;
 
     root.setAttribute('data-theme', theme);
     const activeStatusStyle = theme === 'dark' ? STATUS_STYLE_DARK : STATUS_STYLE_LIGHT;
@@ -1884,7 +1958,7 @@ const ICONS = {
                     return `
                     <tr>
                       <td style="font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;white-space:nowrap;">${fmtDate(v.data)}</td>
-                      <td style="font-weight:700;">${escapeHtml(v.imovel)}${v.fromGoogle ? ' <span title="Importado do Google Agenda">📅</span>' : ''}</td>
+                      <td style="font-weight:700;">${escapeHtml(v.imovel)}${v.fromGoogle ? ' <span title="Importado do Google Agenda">📅</span>' : ''}${v.pendingGoogleSync ? ' <span class="gcal-badge pending" title="Alteração ainda não gravada no Google Agenda. Vai na próxima sincronização automática (até 10 minutos).">↻ agenda</span>' : ''}${v.googleSyncError ? ` <span class="gcal-badge err" title="${escapeHtml(v.googleSyncError)}">⚠ agenda</span>` : ''}</td>
                       <td style="color:var(--ink-soft);">${escapeHtml(v.bairro)}</td>
                       <td>
                         <div class="bairro-combo">
@@ -1927,7 +2001,7 @@ const ICONS = {
         ${activeTab === 'agenda' ? `
           <div class="card">
             <h3>${ICONS.calendar} Sincronização Google Agenda</h3>
-            <p class="sub">Importação automática dos compromissos de visita da sua conta do Google (2025-2035). Conecte uma vez e a atualização continua sozinha a cada 10 minutos, inclusive depois de fechar e abrir a página de novo.${latestSyncedAt() ? ` <span id="sync-countdown" class="sync-countdown"></span>` : ''}</p>
+            <p class="sub">Sincronização nos dois sentidos com a sua conta do Google (2025-2035): os compromissos de visita entram aqui automaticamente, e o que você alterar, criar ou excluir no registro de visitas é gravado de volta na agenda na próxima atualização. Tudo sozinho a cada 10 minutos, inclusive com esta página fechada.${latestSyncedAt() ? ` <span id="sync-countdown" class="sync-countdown"></span>` : ''}</p>
 
             <div class="sync-row">
               <button type="button" class="btn-outline" id="btn-sync-agenda" ${syncStatus.loading?'disabled':''}>
@@ -1939,6 +2013,7 @@ const ICONS = {
             </div>
             
             ${(syncStatus.error || syncStatus.notice) ? `<span class="sync-status ${syncStatus.error?'err':''}">${syncStatus.error || syncStatus.notice}</span>` : ''}
+            ${serverWriteScopeError ? `<span class="sync-status err">${escapeHtml(serverWriteScopeError)}</span>` : ''}
             <span class="sync-status">${syncSummaryText()}</span>
 
             <div class="agenda-filters">
@@ -2051,17 +2126,26 @@ const ICONS = {
     attachEvents();
     updateBrandClock();
 
+    let restoredEl = null;
     if(activeId){
-      const el = document.getElementById(activeId);
-      if(el){
-        if(activeValue!==null && 'value' in el && el.value!==activeValue){
-          el.value = activeValue;
-        }
-        el.focus();
-        if(selStart!=null && el.setSelectionRange){
-          try{ el.setSelectionRange(selStart, selEnd); }catch(e){}
-        }
+      restoredEl = document.getElementById(activeId);
+    } else if(activeDataId && activeFirstClass){
+      restoredEl = document.querySelector(`.${CSS.escape(activeFirstClass)}[data-id="${CSS.escape(activeDataId)}"]`);
+    }
+    if(restoredEl){
+      if(activeValue!==null && 'value' in restoredEl && restoredEl.value!==activeValue){
+        restoredEl.value = activeValue;
       }
+      restoredEl.focus();
+      if(selStart!=null && restoredEl.setSelectionRange){
+        try{ restoredEl.setSelectionRange(selStart, selEnd); }catch(e){}
+      }
+    }
+
+    const tableScrollAfter = document.getElementById('table-scroll');
+    if(tableScrollAfter && savedTableScrollTop!=null){
+      tableScrollAfter.scrollTop = savedTableScrollTop;
+      tableScrollAfter.scrollLeft = savedTableScrollLeft;
     }
   }
 
@@ -2139,10 +2223,10 @@ const ICONS = {
         };
         try{
           if(editingVisitId){
-            await updateDoc(doc(db, 'visits', editingVisitId), entry);
+            await updateDoc(doc(db, 'visits', editingVisitId), {...entry, ...PENDING_GCAL});
           } else {
             const id = uid();
-            await setDoc(doc(db, 'visits', id), entry);
+            await setDoc(doc(db, 'visits', id), {...entry, ...PENDING_GCAL});
           }
           isModalOpen = false;
           editingVisitId = null;
@@ -2210,7 +2294,7 @@ const ICONS = {
         const newStatus = e.target.value;
         if(newStatus === 'Vendido'){ justStampedId = id; }
         try{
-          await updateDoc(doc(db,'visits',id), {status:newStatus});
+          await updateDoc(doc(db,'visits',id), {status:newStatus, ...PENDING_GCAL});
         }catch(err){
           alert('Não foi possível atualizar o status: '+err.message);
         }
@@ -2222,7 +2306,7 @@ const ICONS = {
         const id = btn.getAttribute('data-id');
         btn.disabled = true;
         try{
-          await updateDoc(doc(db,'visits',id), {status:'Realizada'});
+          await updateDoc(doc(db,'visits',id), {status:'Realizada', ...PENDING_GCAL});
         }catch(err){
           alert('Não foi possível marcar como realizada: '+err.message);
           btn.disabled = false;
@@ -2234,8 +2318,22 @@ const ICONS = {
       btn.addEventListener('click', async (e)=>{
         const targetBtn = e.target.closest('[data-del]');
         const id = targetBtn ? targetBtn.getAttribute('data-del') : null;
-        if(id && confirm('Excluir esta visita do registro?')){
+        const v = visits.find(x=>x.id===id);
+        const temEvento = !!(v && v.sourceId);
+        const pergunta = temEvento
+          ? 'Excluir esta visita do registro?\n\nO compromisso correspondente também será apagado do Google Agenda na próxima sincronização.'
+          : 'Excluir esta visita do registro?';
+        if(id && confirm(pergunta)){
           try{
+            // Sem este rastro, a visita voltaria na próxima sincronização: o evento
+            // continuaria existindo na agenda e seria reimportado como novidade.
+            if(temEvento){
+              await setDoc(doc(db,'googleDeletions', v.sourceId), {
+                sourceId: v.sourceId,
+                calendarId: v.calendarId || 'primary',
+                requestedAt: Date.now()
+              });
+            }
             await deleteDoc(doc(db,'visits',id));
           }catch(err){
             alert('Não foi possível excluir: '+err.message);
@@ -2302,7 +2400,7 @@ const ICONS = {
       inp.addEventListener('change', async (e)=>{
         const id = e.target.getAttribute('data-id');
         try{
-          await updateDoc(doc(db,'visits',id), {followup: e.target.value});
+          await updateDoc(doc(db,'visits',id), {followup: e.target.value, ...PENDING_GCAL});
         }catch(err){
           alert('Não foi possível atualizar o follow-up: '+err.message);
         }
@@ -2313,7 +2411,7 @@ const ICONS = {
       inp.addEventListener('change', async (e)=>{
         const id = e.target.getAttribute('data-id');
         try{
-          await updateDoc(doc(db,'visits',id), {telefone: e.target.value.trim()});
+          await updateDoc(doc(db,'visits',id), {telefone: e.target.value.trim(), ...PENDING_GCAL});
         }catch(err){
           alert('Não foi possível atualizar o telefone: '+err.message);
         }
@@ -2324,7 +2422,7 @@ const ICONS = {
       inp.addEventListener('change', async (e)=>{
         const id = e.target.getAttribute('data-id');
         try{
-          await updateDoc(doc(db,'visits',id), {cliente: e.target.value.trim()});
+          await updateDoc(doc(db,'visits',id), {cliente: e.target.value.trim(), ...PENDING_GCAL});
         }catch(err){
           alert('Não foi possível atualizar o cliente: '+err.message);
         }
@@ -2336,7 +2434,7 @@ const ICONS = {
         const id = e.target.getAttribute('data-id');
         if(!id) return;
         try{
-          await updateDoc(doc(db,'visits',id), {bairro2: e.target.value.trim()});
+          await updateDoc(doc(db,'visits',id), {bairro2: e.target.value.trim(), ...PENDING_GCAL});
         }catch(err){
           alert('Não foi possível atualizar o bairro: '+err.message);
         }
@@ -2347,7 +2445,23 @@ const ICONS = {
       inp.addEventListener('focus', ()=>{ renderBairroDropdown(inp); });
       inp.addEventListener('input', ()=>{ renderBairroDropdown(inp); });
       inp.addEventListener('keydown', (e)=>{
-        if(e.key === 'Escape'){ closeAllBairroDropdowns(); }
+        const isOpen = bairroDropdownEl.classList.contains('open') && activeBairroInput === inp;
+        if(e.key === 'Escape'){ closeAllBairroDropdowns(); return; }
+        if(!isOpen) return;
+        if(e.key === 'ArrowDown'){
+          e.preventDefault();
+          highlightBairroOption(bairroActiveIndex + 1);
+        }else if(e.key === 'ArrowUp'){
+          e.preventDefault();
+          highlightBairroOption(bairroActiveIndex - 1);
+        }else if(e.key === 'Enter'){
+          const opts = bairroDropdownEl.querySelectorAll('.bairro-option');
+          const opt = opts[bairroActiveIndex >= 0 ? bairroActiveIndex : 0];
+          if(opt){
+            e.preventDefault();
+            selectBairroOption(opt);
+          }
+        }
       });
     });
 

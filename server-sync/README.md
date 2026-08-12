@@ -1,4 +1,32 @@
-# Sincronização automática via GitHub Actions (gatilho preparado, não ativado)
+# Sincronização automática via GitHub Actions
+
+> ## ⚠️ AÇÃO NECESSÁRIA: regerar o refresh token (uma vez)
+>
+> A sincronização agora é de **mão dupla** — o que é alterado no site é gravado de volta no
+> Google Agenda. Para isso o servidor precisa de permissão de **escrita**, e o refresh token
+> atual só tem permissão de leitura. **Enquanto este passo não for feito, a leitura
+> (Google → site) continua funcionando normalmente, mas nada do site chega na agenda.**
+>
+> ```bash
+> cd server-sync
+> npm install
+> GOOGLE_CLIENT_ID=xxx GOOGLE_CLIENT_SECRET=yyy node get-refresh-token.js
+> ```
+>
+> 1. Abra a URL impressa e faça login **com a conta da agenda** (`kris.noleto@gmail.com`),
+>    não com outra conta — o token fica preso na conta que autorizar.
+> 2. Na tela de permissões, confirme que aparece a opção de **gerenciar/editar** os eventos,
+>    e não só de visualizar. Se aparecer só visualização, o escopo não foi aplicado.
+> 3. O token é gravado em `server-sync/.refresh-token.secret` (não é impresso no terminal).
+> 4. Abra esse arquivo, copie o conteúdo e atualize o GitHub Secret **`GOOGLE_REFRESH_TOKEN`**
+>    em *Settings → Secrets and variables → Actions → GOOGLE_REFRESH_TOKEN → Update*.
+> 5. Apague o arquivo `.refresh-token.secret` depois de colar.
+> 6. Teste em *Actions → Sincronizar Google Agenda → Run workflow*.
+>
+> Se o token ainda estiver sem escopo de escrita, o run termina em vermelho e o próprio site
+> mostra o aviso na aba **Google Agenda** — não fica um erro escondido.
+
+
 
 Isso é o "plano B" caso o teste de deixar o app aberto com a tela apagada não seja suficiente
 (ex: precisa funcionar com o celular bloqueado, ou o computador desligado). Roda inteiramente
