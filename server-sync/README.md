@@ -7,24 +7,36 @@
 > atual só tem permissão de leitura. **Enquanto este passo não for feito, a leitura
 > (Google → site) continua funcionando normalmente, mas nada do site chega na agenda.**
 >
+> **Passo 1 — pegar as credenciais do OAuth Client "Desktop".**
+> No *Google Cloud Console → APIs e Serviços → Credenciais*, clique no OAuth Client do tipo
+> **Aplicativo para computador** e copie o ID do cliente e a chave secreta. (Se a chave não
+> aparecer na tela, use **Transferir JSON** e guarde o arquivo baixado.)
+>
+> **Passo 2 — salvar em `server-sync/.oauth-client.json`** (já está no `.gitignore`):
+> ```json
+> {
+>   "client_id": "....apps.googleusercontent.com",
+>   "client_secret": "GOCSPX-..."
+> }
+> ```
+> O JSON baixado do próprio Google também serve, sem editar nada.
+>
+> **Passo 3 — rodar o script:**
 > ```bash
-> cd server-sync
-> npm install
-> GOOGLE_CLIENT_ID=xxx GOOGLE_CLIENT_SECRET=yyy node get-refresh-token.js
+> node server-sync/get-refresh-token.js
 > ```
 >
-> 1. Abra a URL impressa e faça login **com a conta da agenda** (`kris.noleto@gmail.com`),
->    não com outra conta — o token fica preso na conta que autorizar.
-> 2. Na tela de permissões, confirme que aparece a opção de **gerenciar/editar** os eventos,
->    e não só de visualizar. Se aparecer só visualização, o escopo não foi aplicado.
-> 3. O token é gravado em `server-sync/.refresh-token.secret` (não é impresso no terminal).
-> 4. Abra esse arquivo, copie o conteúdo e atualize o GitHub Secret **`GOOGLE_REFRESH_TOKEN`**
->    em *Settings → Secrets and variables → Actions → GOOGLE_REFRESH_TOKEN → Update*.
-> 5. Apague o arquivo `.refresh-token.secret` depois de colar.
-> 6. Teste em *Actions → Sincronizar Google Agenda → Run workflow*.
+> Ele abre o navegador sozinho. Faça login **com a conta da agenda** (`kris.noleto@gmail.com`),
+> não com outra — o token fica preso na conta que autorizar. Aceite **todas** as permissões
+> pedidas, inclusive a de gerenciar/editar os eventos.
 >
-> Se o token ainda estiver sem escopo de escrita, o run termina em vermelho e o próprio site
-> mostra o aviso na aba **Google Agenda** — não fica um erro escondido.
+> O resto é automático: o script confere se a permissão de escrita foi mesmo concedida,
+> grava o refresh token direto no GitHub Secret `GOOGLE_REFRESH_TOKEN` (via `gh`, sem o token
+> passar pela tela ou pelo histórico do shell) e dispara uma sincronização de teste.
+>
+> Se algo falhar, ele diz exatamente o quê — inclusive o caso em que o Google concede só
+> leitura. E enquanto o token não tiver escopo de escrita, o próprio site mostra o aviso na
+> aba **Google Agenda**, em vez de o erro ficar escondido no log do Actions.
 
 
 

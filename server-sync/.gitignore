@@ -2,4 +2,5 @@ node_modules/
 .env
 .refresh-token.secret
 *.secret
+.oauth-client.json
 service-account*.json
