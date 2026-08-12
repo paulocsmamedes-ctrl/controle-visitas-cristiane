@@ -452,7 +452,17 @@ async function main() {
   }, { merge: true });
 
   console.log('Sincronização concluída:', result);
-  if (writeScopeError) process.exit(1);
+
+  // Falta de permissão de escrita NÃO derruba o run de propósito. É um estado de
+  // configuração conhecido (e já sinalizado em vermelho na tela do site, lendo o
+  // campo writeScopeError acima), não uma falha da sincronização: a leitura roda
+  // inteira e as alterações pendentes ficam guardadas para o próximo ciclo.
+  // Como o cron dispara a cada 10 minutos, encerrar com erro aqui gerava um e-mail
+  // de falha a cada 10 minutos — ruído que ensina a ignorar alerta de verdade.
+  if (writeScopeError) {
+    console.error('\n>>> PENDENTE: ' + writeScopeError);
+    console.error('>>> A leitura rodou normalmente. As alterações do site seguem na fila.\n');
+  }
 }
 
 main().catch(err => {
