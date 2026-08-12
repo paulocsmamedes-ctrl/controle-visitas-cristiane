@@ -83,6 +83,9 @@ function gh(args, input) {
 }
 
 function abrirNavegador(url) {
+  // GCAL_NO_BROWSER=1 desliga a abertura automática — útil quando outra ferramenta
+  // já vai conduzir a autorização numa aba específica, para não abrir duas.
+  if (process.env.GCAL_NO_BROWSER) return;
   const cmd = process.platform === 'win32' ? `start "" "${url}"`
     : process.platform === 'darwin' ? `open "${url}"`
       : `xdg-open "${url}"`;
