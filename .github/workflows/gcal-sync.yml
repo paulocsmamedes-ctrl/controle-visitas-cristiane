@@ -2,7 +2,15 @@ name: Sincronizar Google Agenda
 
 on:
   schedule:
-    - cron: '*/30 * * * *'   # a cada 30 minutos, independente de navegador aberto
+    # A cada 10 minutos, independente de navegador aberto.
+    #
+    # Só é sustentável porque este repositório é PÚBLICO: nesse caso o GitHub
+    # Actions é gratuito e ilimitado, e o consumo não desconta da cota de 2.000
+    # minutos/mês. Se um dia o repositório voltar a ser privado, este cron precisa
+    # voltar para '*/30' — em privado, 10 minutos dá ~4.400 execuções/mês (cada
+    # uma cobrada como 1 minuto cheio, mesmo levando 25 segundos) e estoura a
+    # cota antes da metade do mês, deixando a sincronização fora do ar.
+    - cron: '*/10 * * * *'
   workflow_dispatch: {}       # permite rodar manualmente pela aba Actions do GitHub, para testar
 
 concurrency:
