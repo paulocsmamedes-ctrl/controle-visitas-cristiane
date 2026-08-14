@@ -25,6 +25,45 @@ const DEFAULT_CALENDAR_ID = 'primary';
 // escreveu ANTES deste marcador é preservado intacto a cada gravação.
 const DESC_MARKER = '--- Controle de Visitas ---';
 
+// Texto que a importação antiga gravava quando ninguém escrevia nada. Reconhecer
+// este valor é o que permite preencher as visitas já importadas sem apagar nota real.
+const OBS_IMPORT_PADRAO = 'Importado do Google Agenda';
+
+// Inverso de buildDescription: devolve só o que uma pessoa digitou na descrição do
+// evento, descartando o bloco que este próprio sistema escreve do marcador para baixo.
+// Sem esse corte, cada sincronização importaria o eco do CRM de volta para a observação.
+// A Descrição do evento volta da API como HTML sempre que a pessoa usa o editor
+// com formatação do Google Agenda: cada quebra de linha vira <br>, listas viram
+// <li>, negrito vira <b>. Sem esta conversão a observação chegaria no CRM com as
+// tags à mostra ("Flat 1 Suíte<br>Prédio novo<br>...").
+const ENTIDADES_HTML = { '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&apos;': "'" };
+function htmlParaTexto(valor) {
+  let t = String(valor || '');
+  // Só desmonta tag se houver tag. Mas as entidades são decodificadas SEMPRE:
+  // uma descrição de uma linha só volta como "Deana &amp; Adão", sem tag nenhuma
+  // para detectar, e sair cedo aqui deixaria o "&amp;" cru no campo.
+  if (/<[a-z!/][\s\S]*>/i.test(t)) {
+    t = t.replace(/<\s*br\s*\/?\s*>/gi, '\n')
+         .replace(/<\s*li[^>]*>/gi, '\n• ')     // o marcador já abre a linha...
+         .replace(/<\s*\/\s*(div|p|tr|h[1-6]|ul|ol)\s*>/gi, '\n')   // ...por isso </li> fica fora
+         .replace(/<[^>]*>/g, '');
+  }
+  t = t.replace(/&(?:nbsp|amp|lt|gt|quot|#39|apos);/gi, m => {
+    const chave = m.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(ENTIDADES_HTML, chave) ? ENTIDADES_HTML[chave] : m;
+  });
+  t = t.replace(/&#(\d+);/g, (m, n) => String.fromCharCode(Number(n)));
+  return t.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function obsDoGoogle(descricao) {
+  // Converte ANTES de cortar: assim o marcador é encontrado mesmo quando o Google
+  // transformou a descrição inteira em HTML depois de uma edição com formatação.
+  const texto = htmlParaTexto(descricao);
+  const idx = texto.indexOf(DESC_MARKER);
+  return (idx >= 0 ? texto.slice(0, idx) : texto).trim();
+}
+
 function normalizeText(s) {
   return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
@@ -149,7 +188,7 @@ async function fetchGoogleEvents(accessToken) {
       const iso = start ? start.slice(0, 10) : '';
       if (!iso) return;
       const hora = (ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }) : '';
-      events.push({ id: ev.id, calendarId, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '', raw: ev });
+      events.push({ id: ev.id, calendarId, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '', descricao: ev.description || '', raw: ev });
     });
   });
   return { events, calendarsCount: calendarIds.length };
@@ -366,6 +405,15 @@ async function importGoogleEventsIntoVisits(db, events, opts) {
       if (ev.local && ev.local !== existing.bairro) patch.bairro = ev.local;
       if (!existing.calendarId && ev.calendarId) patch.calendarId = ev.calendarId;
 
+      // Observação escrita na agenda: preenche só quando o CRM não tem nada ou tem
+      // o texto genérico da importação antiga — é isso que faz as visitas já
+      // importadas ganharem a observação sem nunca apagar o que a corretora digitou.
+      const obsGoogle = obsDoGoogle(ev.descricao);
+      const obsAtual = (existing.obs || '').trim();
+      if (obsGoogle && obsGoogle !== obsAtual && (!obsAtual || obsAtual === OBS_IMPORT_PADRAO)) {
+        patch.obs = obsGoogle;
+      }
+
       const dataFinal = patch.data || existing.data;
       if (existing.status === 'Agendada' && dataFinal < today) patch.status = 'Realizada';
 
@@ -388,7 +436,7 @@ async function importGoogleEventsIntoVisits(db, events, opts) {
         telefone: '',
         status: ev.data < today ? 'Realizada' : 'Agendada',
         followup: '',
-        obs: 'Importado do Google Agenda'
+        obs: obsDoGoogle(ev.descricao) || OBS_IMPORT_PADRAO
       }
     });
     imported++;
