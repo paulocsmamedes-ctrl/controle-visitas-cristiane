@@ -16,7 +16,27 @@
  */
 const admin = require('firebase-admin');
 
-const MAX_EVENTS_PER_CALENDAR = 1000;
+/* TETO DE SEGURANÇA, NÃO LIMITE DE LEITURA — corrigido em 20/08/2026.
+
+   Até aqui este número valia 1000 e a paginação parava nele. Como a busca vem
+   ordenada por data crescente (orderBy: 'startTime'), parar no evento 1000
+   significava ler só os MAIS ANTIGOS: a agenda passou desse volume e a leitura
+   ficou congelada em 2025. `totalEvents: 1000` apareceu idêntico em todas as
+   execuções verificadas entre 16 e 20/08 — número travado é teto batendo.
+
+   O estrago era duplo e silencioso:
+     1. compromisso novo na agenda nunca chegava ao CRM (nada recente era lido);
+     2. alteração feita no site em visita ligada a um evento fora da janela caía
+        no ramo "o evento sumiu do Google" de pushPendingVisits, que limpava
+        `pendingGoogleSync` SEM gravar nada — a alteração era descartada sem
+        erro, sem log e sem aviso na tela.
+
+   Agora a paginação vai até o fim. Este teto continua existindo só para o caso
+   patológico (um recorrente semanal expandido até 2035 vira ~520 ocorrências), e
+   bater nele passou a ser um ESTADO DECLARADO: `truncado: true` desliga a
+   exclusão automática e segura os envios na fila, em vez de tratar uma lista
+   parcial como completa. Ver `leituraCompleta` em fetchGoogleEvents. */
+const MAX_EVENTS_PER_CALENDAR = 20000;
 const SYNC_TIME_MIN = '2025-01-01T00:00:00Z';
 const SYNC_TIME_MAX = '2035-12-31T23:59:59Z';
 const DEFAULT_CALENDAR_ID = 'primary';
@@ -149,9 +169,17 @@ async function fetchCalendarIds(accessToken) {
   return (data.items || []).filter(c => !isHolidayCalendar(c)).map(c => c.id);
 }
 
-async function fetchEventsFromCalendar(accessToken, calendarId) {
+/* Devolve SEMPRE {events, truncado, erro} — nunca só a lista.
+
+   O `catch { break }` que existia aqui era o pior tipo de erro: um calendário
+   que falhasse no meio da paginação devolvia a lista parcial (ou vazia) com
+   cara de calendário lido inteiro, e a fase de leitura apagava do CRM toda
+   visita cujo evento tivesse ficado de fora. Agora a falha viaja junto com o
+   resultado e quem chama decide o que fazer com ela. */
+async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal) {
   let events = [];
   let pageToken;
+  let truncado = false;
   do {
     const url = new URL('https://www.googleapis.com/calendar/v3/calendars/' + encodeURIComponent(calendarId) + '/events');
     url.searchParams.set('timeMin', SYNC_TIME_MIN);
@@ -164,19 +192,45 @@ async function fetchEventsFromCalendar(accessToken, calendarId) {
     try {
       data = await calendarFetch(accessToken, url);
     } catch (e) {
-      break;
+      return { events, truncado: true, erro: String((e && e.message) || e) };
     }
     events = events.concat(data.items || []);
     pageToken = data.nextPageToken;
-  } while (pageToken && events.length < MAX_EVENTS_PER_CALENDAR);
-  return events;
+    if (pageToken && events.length >= MAX_EVENTS_PER_CALENDAR) { truncado = true; break; }
+    // Orçamento de tempo: o ciclo dispara de 10 em 10 minutos com
+    // `cancel-in-progress`, então uma leitura que se arrastasse seria cancelada
+    // pela execução seguinte — e a sincronização nunca terminaria. Estourar o
+    // prazo é tratado como leitura parcial, que já é um estado seguro: não apaga
+    // visita e não descarta alteração pendente.
+    if (pageToken && Date.now() > prazoFinal) { truncado = true; break; }
+  } while (pageToken);
+  return { events, truncado, erro: null };
 }
+
+// Prazo da fase de leitura inteira. O job leva ~25 s hoje; 3 minutos dão folga
+// larga para uma agenda grande sem chegar perto do disparo seguinte (10 min).
+const PRAZO_LEITURA_MS = 3 * 60 * 1000;
 
 async function fetchGoogleEvents(accessToken) {
   const calendarIds = await fetchCalendarIds(accessToken);
+  const prazoFinal = Date.now() + PRAZO_LEITURA_MS;
   const rawByCalendar = await Promise.all(
-    calendarIds.map(id => fetchEventsFromCalendar(accessToken, id).then(list => ({ id, list })).catch(() => ({ id, list: [] })))
+    calendarIds.map(id => fetchEventsFromCalendar(accessToken, id, prazoFinal)
+      .then(r => ({ id, list: r.events, truncado: r.truncado, erro: r.erro }))
+      .catch(e => ({ id, list: [], truncado: true, erro: String((e && e.message) || e) })))
   );
+
+  /* LEITURA COMPLETA = nenhum calendário truncado e nenhum erro de leitura.
+
+     É a única evidência que autoriza as duas operações destrutivas do ciclo:
+     apagar visita cujo evento "sumiu" e descartar alteração pendente cujo
+     evento "não existe mais". Sem lista completa, as duas frases entre aspas
+     são chute — e o chute apaga trabalho da corretora. */
+  const porCalendario = rawByCalendar.map(c => ({ id: c.id, eventos: c.list.length, truncado: !!c.truncado, erro: c.erro || null }));
+  const leituraCompleta = porCalendario.every(c => !c.truncado && !c.erro);
+  porCalendario.filter(c => c.truncado || c.erro).forEach(c => {
+    console.error('Leitura incompleta do calendário ' + c.id + ':', c.erro || ('teto de ' + MAX_EVENTS_PER_CALENDAR + ' eventos'));
+  });
 
   const seen = new Set();
   const events = [];
@@ -191,17 +245,26 @@ async function fetchGoogleEvents(accessToken) {
       events.push({ id: ev.id, calendarId, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '', descricao: ev.description || '', raw: ev });
     });
   });
-  return { events, calendarsCount: calendarIds.length };
+  return { events, calendarsCount: calendarIds.length, leituraCompleta, porCalendario };
 }
 
 // -------------------------------------------------- montagem do evento a gravar
+
+/* ESPELHO de bairroDe() nas duas interfaces: o mesmo conceito mora em DOIS
+   campos e nenhum dos dois pode ser lido sozinho. `bairro` é o que esta
+   sincronização grava (vem do `location` do compromisso) e `bairro2` é o que a
+   interface e a importação de planilha gravam. Ler só um dos dois foi o que
+   fazia o endereço sumir do compromisso na agenda. */
+function localDaVisita(visit) {
+  return String((visit && (visit.bairro || visit.bairro2)) || '').trim();
+}
 
 function buildDescription(visit, previousDescription) {
   const linhas = [DESC_MARKER];
   if (visit.cliente) linhas.push('Cliente: ' + visit.cliente);
   if (visit.telefone) linhas.push('Telefone: ' + visit.telefone);
   if (visit.status) linhas.push('Status: ' + visit.status);
-  if (visit.bairro2) linhas.push('Bairro: ' + visit.bairro2);
+  if (visit.bairro2 || visit.bairro) linhas.push('Bairro: ' + (visit.bairro2 || visit.bairro));
   if (visit.followup) linhas.push('Retorno: ' + visit.followup);
   if (visit.obs) linhas.push('Observações: ' + visit.obs);
 
@@ -243,10 +306,10 @@ function datasParaGoogle(evOriginal, novaDataISO) {
 
 // ------------------------------------------------- ENVIO: CRM -> Google Agenda
 
-async function pushPendingVisits(db, accessToken, eventById) {
+async function pushPendingVisits(db, accessToken, eventById, leituraCompleta) {
   const snap = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
   const criados = new Set();
-  let enviados = 0, criadosCount = 0, falhas = 0;
+  let enviados = 0, criadosCount = 0, falhas = 0, descartados = 0, adiados = 0;
   let scopeError = null;
 
   for (const docSnap of snap.docs) {
@@ -255,8 +318,24 @@ async function pushPendingVisits(db, accessToken, eventById) {
       const existente = v.sourceId ? eventById.get(v.sourceId) : null;
 
       if (v.sourceId && !existente) {
-        // O evento sumiu do Google (excluído por lá). Não recria: a fase de leitura
-        // vai remover a visita. Só limpa a marcação para não tentar de novo eternamente.
+        /* O evento não está na lista lida. Isso tem DUAS causas possíveis, e
+           tratá-las como uma só foi o bug que engoliu alterações por dias:
+
+             a) o evento foi mesmo excluído no Google — aí não há o que gravar;
+             b) o evento existe, mas a leitura deste ciclo não o alcançou.
+
+           Só (a) autoriza jogar a alteração fora. Sem leitura completa, a
+           alteração FICA na fila: `pendingGoogleSync` continua true e o próximo
+           ciclo tenta de novo. A visita mostra o aviso na tabela do site, que já
+           lê `googleSyncError`. */
+        if (!leituraCompleta) {
+          adiados++;
+          await docSnap.ref.update({
+            googleSyncError: 'A agenda foi lida só em parte neste ciclo. A alteração continua na fila e será enviada no próximo.'
+          });
+          continue;
+        }
+        descartados++;
         await docSnap.ref.update({ pendingGoogleSync: false, googleSyncError: null });
         continue;
       }
@@ -265,9 +344,14 @@ async function pushPendingVisits(db, accessToken, eventById) {
         const calendarId = v.calendarId || existente.calendarId || DEFAULT_CALENDAR_ID;
         const body = {
           summary: tituloParaGoogle(v.imovel),
-          location: v.bairro || '',
           description: buildDescription(v, existente.raw && existente.raw.description)
         };
+        // `location` só entra quando há endereço para escrever. Mandar '' APAGAVA
+        // o local do compromisso na agenda dela toda vez que a visita tivesse só
+        // o bairro preenchido (o campo `bairro2`, que é o que a interface nova
+        // grava) — a correção do endereço virava perda de endereço.
+        const local = localDaVisita(v);
+        if (local) body.location = local;
         const datas = v.data ? datasParaGoogle(existente.raw, v.data) : null;
         if (datas) Object.assign(body, datas);
 
@@ -291,7 +375,7 @@ async function pushPendingVisits(db, accessToken, eventById) {
         const titulo = tituloParaGoogle(v.imovel);
         const body = {
           summary: titulo,
-          location: v.bairro || '',
+          location: localDaVisita(v),
           description: buildDescription(v, ''),
           start: { date: v.data },
           end: { date: addDaysISO(v.data, 1) }
@@ -320,7 +404,7 @@ async function pushPendingVisits(db, accessToken, eventById) {
     }
   }
 
-  return { enviados, criados: criadosCount, falhas, criadosIds: criados, scopeError };
+  return { enviados, criados: criadosCount, falhas, descartados, adiados, criadosIds: criados, scopeError };
 }
 
 // ---------------------------------------- EXCLUSÃO: CRM -> Google Agenda
@@ -360,7 +444,7 @@ async function processDeletions(db, accessToken) {
 // ------------------------------------------- LEITURA: Google Agenda -> CRM
 
 async function importGoogleEventsIntoVisits(db, events, opts) {
-  const { criadosIds = new Set(), excluidosIds = new Set() } = opts || {};
+  const { criadosIds = new Set(), excluidosIds = new Set(), leituraCompleta = true } = opts || {};
   const today = todayISO();
   const visitsSnap = await db.collection('visits').get();
   const visits = visitsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -372,7 +456,14 @@ async function importGoogleEventsIntoVisits(db, events, opts) {
   criadosIds.forEach(id => currentEventIds.add(id));   // criados agora ainda não estavam na busca
   excluidosIds.forEach(id => currentEventIds.delete(id));
 
-  const toRemove = visits.filter(v => {
+  /* A EXCLUSÃO AUTOMÁTICA SÓ RODA COM A LISTA COMPLETA.
+
+     "O evento não está na lista" só significa "o evento foi apagado" quando a
+     lista é toda a agenda. Com leitura truncada ou com um calendário que falhou,
+     a mesma frase significa "não li esse pedaço" — e apagar aí destrói visita
+     que está viva no Google. Este era o risco latente do teto de 1000: enquanto
+     a fronteira não se mexia, `removed` dava 0 e ninguém via o perigo. */
+  const toRemove = !leituraCompleta ? [] : visits.filter(v => {
     if (!v.fromGoogle || !v.sourceId) return false;   // visitas nascidas no CRM não são removidas pelo sync
     if (v.pendingGoogleSync) return false;            // tem alteração local esperando envio
     if (!currentEventIds.has(v.sourceId)) return true; // o evento sumiu da agenda
@@ -455,7 +546,7 @@ async function importGoogleEventsIntoVisits(db, events, opts) {
     await batch.commit();
   }
 
-  return { imported, updated, skipped, removed, totalEvents: events.length };
+  return { imported, updated, skipped, removed, totalEvents: events.length, leituraCompleta };
 }
 
 // ------------------------------------------------------------------- execução
@@ -466,14 +557,19 @@ async function main() {
   const db = admin.firestore();
 
   const accessToken = await getFreshAccessToken();
-  const { events, calendarsCount } = await fetchGoogleEvents(accessToken);
+  const { events, calendarsCount, leituraCompleta, porCalendario } = await fetchGoogleEvents(accessToken);
   const eventById = new Map(events.map(ev => [ev.id, ev]));
+
+  // Quantos eventos vieram de cada calendário, sempre. Sem esta linha, "1000
+  // eventos no total" não dizia se era uma agenda grande ou um teto batendo —
+  // e foi exatamente essa ambiguidade que escondeu o bug por dias.
+  console.log('Calendários lidos:', JSON.stringify(porCalendario));
 
   // 1. Envio e exclusão são isolados em try/catch: uma falha de escrita NUNCA pode
   //    derrubar a leitura, que é o que mantém o CRM funcionando.
-  let push = { enviados: 0, criados: 0, falhas: 0, criadosIds: new Set(), scopeError: null };
+  let push = { enviados: 0, criados: 0, falhas: 0, descartados: 0, adiados: 0, criadosIds: new Set(), scopeError: null };
   let del = { excluidos: 0, falhas: 0, excluidosIds: new Set(), scopeError: null };
-  try { push = await pushPendingVisits(db, accessToken, eventById); }
+  try { push = await pushPendingVisits(db, accessToken, eventById, leituraCompleta); }
   catch (e) { console.error('Envio para o Google falhou:', e.message); push.falhas++; }
   try { del = await processDeletions(db, accessToken); }
   catch (e) { console.error('Exclusão no Google falhou:', e.message); del.falhas++; }
@@ -484,13 +580,19 @@ async function main() {
   // 2. Leitura (Google -> CRM), sempre.
   const result = await importGoogleEventsIntoVisits(db, events, {
     criadosIds: push.criadosIds,
-    excluidosIds: del.excluidosIds
+    excluidosIds: del.excluidosIds,
+    leituraCompleta
   });
   result.calendars = calendarsCount;
   result.enviados = push.enviados;
   result.criadosNoGoogle = push.criados;
   result.excluidosNoGoogle = del.excluidos;
   result.falhasDeEnvio = push.falhas + del.falhas;
+  // Estes dois eram o ponto cego: alteração que o ciclo jogou fora e alteração
+  // que ficou esperando. Antes, os dois casos apareciam no log como `enviados: 0`,
+  // idêntico a "não havia nada para enviar".
+  result.descartados = push.descartados;
+  result.adiados = push.adiados;
 
   await db.collection('meta').doc('googleSync').set({
     lastSyncedAt: admin.firestore.FieldValue.serverTimestamp(),

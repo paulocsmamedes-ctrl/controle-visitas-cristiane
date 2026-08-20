@@ -1077,13 +1077,21 @@ const ICONS = {
     return isHoliday || isBirthdays;
   }
 
-  const MAX_EVENTS_PER_CALENDAR = 1000;
+  /* TETO DE SEGURANÇA, NÃO LIMITE DE LEITURA — corrigido em 20/08/2026 nos três
+     arquivos, no mesmo commit (este, a interface nova e server-sync/sync.js).
+     Valia 1000, e como a busca vem em ordem crescente de data isso era ler só os
+     eventos MAIS ANTIGOS: nada recente chegava, e a remoção automática passava a
+     enxergar como "apagado no Google" todo evento além da fronteira. */
+  const MAX_EVENTS_PER_CALENDAR = 20000;
   const SYNC_TIME_MIN = '2025-01-01T00:00:00Z';
   const SYNC_TIME_MAX = '2035-12-31T23:59:59Z';
 
+  // Devolve SEMPRE { events, truncado, erro }: calendário que falhou no meio não
+  // pode voltar com cara de calendário vazio, senão a remoção apaga as visitas dele.
   async function fetchEventsFromCalendar(calendarId){
     let events = [];
     let pageToken;
+    let truncado = false;
     do{
       const url = new URL('https://www.googleapis.com/calendar/v3/calendars/'+encodeURIComponent(calendarId)+'/events');
       url.searchParams.set('timeMin', SYNC_TIME_MIN);
@@ -1094,18 +1102,31 @@ const ICONS = {
       if(pageToken) url.searchParams.set('pageToken', pageToken);
       const res = await fetch(url, { headers: { Authorization: 'Bearer '+gcalAccessToken } });
       const data = await res.json();
-      if(!res.ok) break;
+      if(!res.ok){
+        const msg = (data && data.error && data.error.message) || ('HTTP '+res.status);
+        return { events, truncado: true, erro: msg };
+      }
       events = events.concat(data.items||[]);
       pageToken = data.nextPageToken;
-    } while(pageToken && events.length < MAX_EVENTS_PER_CALENDAR);
-    return events;
+      if(pageToken && events.length >= MAX_EVENTS_PER_CALENDAR){ truncado = true; break; }
+    } while(pageToken);
+    return { events, truncado, erro: null };
   }
 
   async function fetchGoogleEvents(){
     const calendarIds = await fetchCalendarIds();
     const rawByCalendar = await Promise.all(
-      calendarIds.map(id => fetchEventsFromCalendar(id).then(list=>({id, list})).catch(()=>({id, list:[]})))
+      calendarIds.map(id => fetchEventsFromCalendar(id)
+        .then(r=>({id, list:r.events, truncado:r.truncado, erro:r.erro}))
+        .catch(e=>({id, list:[], truncado:true, erro:String((e&&e.message)||e)})))
     );
+
+    // Lista completa é a única evidência que autoriza apagar visita cujo evento
+    // "sumiu". Sem ela, "sumiu" é chute — e o chute apaga trabalho.
+    const leituraCompleta = rawByCalendar.every(c => !c.truncado && !c.erro);
+    rawByCalendar.filter(c => c.truncado || c.erro).forEach(c => {
+      console.warn('Leitura incompleta do calendário '+c.id+':', c.erro || ('teto de '+MAX_EVENTS_PER_CALENDAR+' eventos'));
+    });
 
     const seen = new Set();
     const events = [];
@@ -1125,7 +1146,7 @@ const ICONS = {
     agendaSyncedAt = Date.now();
     nextAutoSyncAt = agendaSyncedAt + 10*60*1000;
     storageSet(AGENDA_KEY, JSON.stringify({events: agendaEvents, syncedAt: agendaSyncedAt}));
-    const importResult = await importGoogleEventsIntoVisits(events);
+    const importResult = await importGoogleEventsIntoVisits(events, leituraCompleta);
     importResult.calendars = calendarIds.length;
     importResult.totalEvents = events.length;
     syncStatus = { loading:false, error:null, lastImport: importResult };
@@ -1136,7 +1157,19 @@ const ICONS = {
     return String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
   }
 
-  async function importGoogleEventsIntoVisits(events){
+  async function importGoogleEventsIntoVisits(events, leituraCompleta = true){
+    /* TRAVA CONTRA DUPLICAÇÃO EM MASSA — espelho da mesma trava na interface
+       nova (Site 2 Cristiane). Se `visits` ainda estiver vazio porque o
+       onSnapshot não respondeu, todo evento parece novo e esta função recria a
+       coleção inteira: mesmo sourceId, ids diferentes. Aconteceu em
+       14/08/2026 na interface nova — 42 registros viraram 126.
+       O sync do servidor não precisa disto: ele lê `visits` do Firestore dentro
+       da própria função, nunca de um cache em memória. */
+    if(visitsLoading){
+      console.warn('Importação adiada: as visitas ainda não chegaram do banco.');
+      return { imported: 0, updated: 0, skipped: events.length, removed: 0, adiado: true };
+    }
+
     const today = todayISO();
     let imported = 0, updated = 0, skipped = 0, removed = 0;
 
@@ -1146,7 +1179,9 @@ const ICONS = {
     const eventById = new Map(events.map(ev=>[ev.id, ev]));
     const currentEventIds = new Set(events.map(ev=>ev.id));
 
-    const toRemove = visits.filter(v => {
+    // A remoção automática só roda com a lista completa — mesma trava dos outros
+    // dois arquivos. Lista parcial faz "o evento sumiu" virar chute.
+    const toRemove = !leituraCompleta ? [] : visits.filter(v => {
       if(!v.fromGoogle || !v.sourceId) return false;   // visitas nascidas no CRM não são removidas pelo sync
       if(v.pendingGoogleSync) return false;            // tem alteração local esperando envio ao Google
       if(!currentEventIds.has(v.sourceId)) return true; // o evento sumiu da agenda
