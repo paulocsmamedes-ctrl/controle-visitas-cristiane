@@ -1,6 +1,6 @@
 /**
  * Sincronização de MÃO DUPLA entre o Google Agenda e o Firestore, pensada para
- * rodar sem navegador nenhum aberto (GitHub Actions, disparado a cada 10 min).
+ * rodar sem navegador nenhum aberto (GitHub Actions, disparado a cada 5 min pelo cron-job.org).
  *
  * Ordem de execução de cada ciclo:
  *   1. Busca todos os eventos de todos os calendários (guardando de qual calendário veio cada um).
@@ -88,9 +88,15 @@ function normalizeText(s) {
   return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 }
 
+/* "Hoje" no fuso da corretora, não no do servidor — corrigido em 07/10/2026.
+   O runner do GitHub Actions roda em UTC, então das 21h à meia-noite de
+   Brasília o getDate() local já devolvia AMANHÃ. Nessas três horas, toda visita
+   do dia era tratada como passada: a importada nascia 'Realizada' em vez de
+   'Agendada', e as agendadas do dia viravam 'Realizada' às 21h — o que ainda
+   ligava o relógio de 14 dias antes da visita acontecer. O navegador nunca
+   teve isso porque já roda no fuso dela. 'en-CA' é o formato AAAA-MM-DD. */
 function todayISO() {
-  const d = new Date();
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 }
 
 function isHolidayCalendar(c) {
@@ -197,7 +203,7 @@ async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal) {
     events = events.concat(data.items || []);
     pageToken = data.nextPageToken;
     if (pageToken && events.length >= MAX_EVENTS_PER_CALENDAR) { truncado = true; break; }
-    // Orçamento de tempo: o ciclo dispara de 10 em 10 minutos com
+    // Orçamento de tempo: o ciclo dispara de 5 em 5 minutos com
     // `cancel-in-progress`, então uma leitura que se arrastasse seria cancelada
     // pela execução seguinte — e a sincronização nunca terminaria. Estourar o
     // prazo é tratado como leitura parcial, que já é um estado seguro: não apaga
@@ -208,7 +214,7 @@ async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal) {
 }
 
 // Prazo da fase de leitura inteira. O job leva ~25 s hoje; 3 minutos dão folga
-// larga para uma agenda grande sem chegar perto do disparo seguinte (10 min).
+// larga para uma agenda grande sem chegar perto do disparo seguinte (5 min).
 const PRAZO_LEITURA_MS = 3 * 60 * 1000;
 
 async function fetchGoogleEvents(accessToken) {
@@ -607,8 +613,8 @@ async function main() {
   // configuração conhecido (e já sinalizado em vermelho na tela do site, lendo o
   // campo writeScopeError acima), não uma falha da sincronização: a leitura roda
   // inteira e as alterações pendentes ficam guardadas para o próximo ciclo.
-  // Como o cron dispara a cada 10 minutos, encerrar com erro aqui gerava um e-mail
-  // de falha a cada 10 minutos — ruído que ensina a ignorar alerta de verdade.
+  // Como o cron dispara a cada 5 minutos, encerrar com erro aqui gerava um e-mail
+  // de falha a cada 5 minutos — ruído que ensina a ignorar alerta de verdade.
   if (writeScopeError) {
     console.error('\n>>> PENDENTE: ' + writeScopeError);
     console.error('>>> A leitura rodou normalmente. As alterações do site seguem na fila.\n');
