@@ -253,7 +253,7 @@ async function fetchGoogleEvents(accessToken) {
       if (!ev.id || seen.has(eventKey(calendarId, ev.id))) return;
       seen.add(eventKey(calendarId, ev.id));
       const start = ev.start && (ev.start.dateTime || ev.start.date);
-      const iso = start ? start.slice(0, 10) : '';
+      const iso = ev.start?.dateTime ? new Intl.DateTimeFormat('en-CA', {timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(start)) : start ? start.slice(0,10) : '';
       if (!iso) return;
       const hora = (ev.start && ev.start.dateTime) ? new Date(ev.start.dateTime).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }) : '';
       events.push({ id: ev.id, calendarId, titulo: ev.summary || '(sem título)', data: iso, hora, local: ev.location || '', descricao: ev.description || '', raw: ev });
@@ -518,6 +518,9 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
         const v = current.data();
         if (v.pendingGoogleSync) return 'skipped';
         const patch = {};
+        const startAt = ev.raw?.start?.dateTime || null;
+        if ((v.googleStartAt || null) !== startAt) patch.googleStartAt = startAt;
+        if ((v.googleStartDate || null) !== (startAt ? ev.data : null)) patch.googleStartDate = startAt ? ev.data : null;
         if (ev.data !== v.data) patch.data = ev.data;
         if (ev.titulo && ev.titulo !== v.imovel) patch.imovel = ev.titulo;
         if (ev.local && ev.local !== v.bairro) patch.bairro = ev.local;
@@ -529,6 +532,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
         tx.update(ref, patch); return 'updated';
       }
       tx.create(ref, { sourceId: ev.id, calendarId: ev.calendarId, fromGoogle: true,
+        googleStartAt: ev.raw?.start?.dateTime || null, googleStartDate: ev.raw?.start?.dateTime ? ev.data : null,
         data: ev.data, imovel: ev.titulo, bairro: ev.local || '', cliente: '', telefone: '',
         status: ev.data < today ? 'Realizada' : 'Agendada', followup: '', obs: obsDoGoogle(ev.descricao) || OBS_IMPORT_PADRAO });
       return 'imported';
@@ -538,6 +542,29 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
     else skipped++;
   }
   return { imported, updated, skipped, removed: 0, totalEvents: events.length, leituraCompleta };
+}
+
+function visitaAtingiuHorario(v, now = Date.now()) {
+  if (v.status !== 'Agendada' || !v.sourceId || v.foraDoFunil || v.pendingGoogleSync || ['deleted','unavailable'].includes(v.googleCalendarState)) return false;
+  const start = Date.parse(v.googleStartAt || '');
+  const today = new Intl.DateTimeFormat('en-CA', {timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now));
+  return Number.isFinite(start) && v.googleStartDate === v.data && v.data === today && start <= now;
+}
+
+async function concluirVisitasPorHorario(db, now = Date.now()) {
+  const snap = await db.collection('visits').get();
+  let count = 0;
+  for (const snapshot of snap.docs) {
+    if (!visitaAtingiuHorario(snapshot.data(), now)) continue;
+    const done = await db.runTransaction(async tx => {
+      const current = await tx.get(snapshot.ref);
+      if (!current.exists || !visitaAtingiuHorario(current.data(), now)) return false;
+      tx.update(snapshot.ref, { status:'Realizada', statusEm:current.data().data, realizadaPorHorario:true, realizadaAutomaticamenteEm:admin.firestore.FieldValue.serverTimestamp() });
+      return true;
+    });
+    if (done) count++;
+  }
+  return count;
 }
 
 async function main() {
@@ -557,6 +584,7 @@ async function main() {
     const reconciliation = await reconcileGoogleDeletions(db, accessToken, eventById);
     push = await pushPendingVisits(db, accessToken, eventById);
     const result = await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta });
+    result.realizadasPorHorario = await concluirVisitasPorHorario(db);
     const pending = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
     const deletionQueue = await db.collection('googleDeletions').get();
     const remainingDeletions = deletionQueue.docs.filter(d => !d.data().completedAt).length;
@@ -582,5 +610,5 @@ async function main() {
 if (require.main === module) {
   main().catch(err => { console.error('Sincronização falhou:', err.message); process.exitCode = 1; });
 }
-module.exports = { main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
+module.exports = { visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
   importedVisitId, createdEventId, reconcileGoogleDeletions, acknowledgePush, pushPendingVisits, processDeletions, importGoogleEventsIntoVisits };

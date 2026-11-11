@@ -116,3 +116,20 @@ test('edição pendente de evento excluído não recria compromisso',async()=>{
 test('404 posterior não desfaz exclusão já confirmada',async()=>{
  const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',googleCalendarState:'deleted'}});mockFetch(async()=>response({error:{message:'not found'}},404));await api.reconcileGoogleDeletions(db,'token',new Map());assert.equal(db.snapshot('visits/v1').data().googleCalendarState,'deleted');
 });
+
+test('horário inicia conclusão no instante certo sem afetar dia inteiro, exclusão ou edição pendente',()=>{
+ const check=api.visitaAtingiuHorario;
+ const v={sourceId:'event',status:'Agendada',data:'2026-11-11',googleStartDate:'2026-11-11',googleStartAt:'2026-11-11T12:00:00-03:00'};
+ const start=Date.parse(v.googleStartAt);
+ assert.equal(check(v,start-1),false);assert.equal(check(v,start),true);assert.equal(check(v,start+60000),true);
+ for(const patch of [{googleStartAt:null},{googleCalendarState:'deleted'},{googleCalendarState:'unavailable'},{pendingGoogleSync:true},{data:'2026-11-12'},{status:'Realizada'},{foraDoFunil:true}])assert.equal(check({...v,...patch},start),false);
+ assert.equal(check(v,start+86400000),false);
+});
+
+test('importação persiste horário e conclusão automática é idempotente',async()=>{
+ const db=new MemoryDB();const ev={...event(),data:'2026-11-11',raw:{start:{dateTime:'2026-11-11T12:00:00-03:00'}}};
+ await api.importGoogleEventsIntoVisits(db,[ev]);const snap=await db.collection('visits').get();const ref=snap.docs[0].ref;
+ assert.equal(snap.docs[0].data().googleStartAt,ev.raw.start.dateTime);
+ await ref.update({status:'Agendada'});const time=Date.parse(ev.raw.start.dateTime);
+ assert.equal(await api.concluirVisitasPorHorario(db,time),1);assert.equal(await api.concluirVisitasPorHorario(db,time),0);assert.equal((await ref.get()).data().status,'Realizada');
+});
