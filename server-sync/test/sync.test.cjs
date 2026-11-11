@@ -137,3 +137,8 @@ test('importação persiste horário e conclusão automática é idempotente',as
 test('edição posterior à exclusão permanece local e limpa fila sem perder a observação',async()=>{
  const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',status:'Atendimento finalizado',finalizadaPorExclusao:true,googleCalendarState:'deleted',pendingGoogleSync:true,googleSyncError:'antigo',obs:'Nota nova'}});let calls=0;mockFetch(async()=>{calls++;return response({})});await api.pushPendingVisits(db,'token',new Map());const v=db.snapshot('visits/v1').data();assert.equal(calls,0);assert.equal(v.pendingGoogleSync,false);assert.equal(v.googleSyncError,null);assert.equal(v.obs,'Nota nova');
 });
+
+test('ciclo sem mudança não abre transações para cada visita já importada',async()=>{
+ const db=new MemoryDB();await api.importGoogleEventsIntoVisits(db,[event()]);let calls=0;const previous=db.runTransaction.bind(db);db.runTransaction=fn=>{calls++;return previous(fn)};
+ const result=await api.importGoogleEventsIntoVisits(db,[event()]);assert.equal(calls,0);assert.equal(result.updated,0);
+});

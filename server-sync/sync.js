@@ -358,8 +358,8 @@ async function settleDeletedVisit(db, snapshot) {
   });
 }
 
-async function reconcileGoogleDeletions(db, accessToken, eventById) {
-  const visits = await db.collection('visits').get();
+async function reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot = null) {
+  const visits = visitsSnapshot || await db.collection('visits').get();
   let marked = 0, restored = 0, unavailable = 0, failed = 0;
   for (const snapshot of visits.docs) {
     const v = snapshot.data();
@@ -503,10 +503,25 @@ async function processDeletions(db, accessToken) {
 
 // Somente o servidor importa. Não se apaga histórico por ausência, renomeação,
 // perda de acesso ou janela de datas; exclusões são pedidos explícitos do CRM.
+function patchDaAgenda(v, ev, today) {
+  const patch = {};
+  const startAt = ev.raw?.start?.dateTime || null;
+  if ((v.googleStartAt || null) !== startAt) patch.googleStartAt = startAt;
+  if ((v.googleStartDate || null) !== (startAt ? ev.data : null)) patch.googleStartDate = startAt ? ev.data : null;
+  if (ev.data !== v.data) patch.data = ev.data;
+  if (ev.titulo && ev.titulo !== v.imovel) patch.imovel = ev.titulo;
+  if (ev.local && ev.local !== v.bairro) patch.bairro = ev.local;
+  if (!v.calendarId) patch.calendarId = ev.calendarId;
+  const obs = obsDoGoogle(ev.descricao);
+  if (obs && obs !== (v.obs || '').trim() && (!(v.obs || '').trim() || v.obs === OBS_IMPORT_PADRAO)) patch.obs = obs;
+  if (v.status === 'Agendada' && (patch.data || v.data) < today) patch.status = 'Realizada';
+  return patch;
+}
+
 async function importGoogleEventsIntoVisits(db, events, opts = {}) {
   const { protegidos = new Set(), excluidosIds = new Set(), pendentesIds = new Set(), leituraCompleta = true } = opts;
   const today = todayISO();
-  const visits = await db.collection('visits').get();
+  const visits = opts.visitsSnapshot || await db.collection('visits').get();
   const byKey = new Map();
   const legacy = new Map();
   const counts = new Map();
@@ -523,6 +538,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
     if (!ev.data || ev.raw?.status === 'cancelled' || !normalizeText(ev.titulo).includes('visita') || protegidos.has(key) || excluidosIds.has(key) || pendentesIds.has(key)) { skipped++; continue; }
     if (legacy.has(ev.id) && counts.get(ev.id) !== 1) { skipped++; continue; }
     const snapshot = byKey.get(key) || legacy.get(ev.id);
+    if (snapshot && (snapshot.data().pendingGoogleSync || !Object.keys(patchDaAgenda(snapshot.data(),ev,today)).length)) { skipped++; continue; }
     const ref = snapshot ? snapshot.ref : db.collection('visits').doc(importedVisitId(ev.calendarId, ev.id));
     const deletionRef = db.collection('googleDeletions').doc(importedVisitId(ev.calendarId, ev.id));
     const legacyDeletionRef = db.collection('googleDeletions').doc(ev.id);
@@ -535,17 +551,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
       if (current.exists) {
         const v = current.data();
         if (v.pendingGoogleSync) return 'skipped';
-        const patch = {};
-        const startAt = ev.raw?.start?.dateTime || null;
-        if ((v.googleStartAt || null) !== startAt) patch.googleStartAt = startAt;
-        if ((v.googleStartDate || null) !== (startAt ? ev.data : null)) patch.googleStartDate = startAt ? ev.data : null;
-        if (ev.data !== v.data) patch.data = ev.data;
-        if (ev.titulo && ev.titulo !== v.imovel) patch.imovel = ev.titulo;
-        if (ev.local && ev.local !== v.bairro) patch.bairro = ev.local;
-        if (!v.calendarId) patch.calendarId = ev.calendarId;
-        const obs = obsDoGoogle(ev.descricao);
-        if (obs && obs !== (v.obs || '').trim() && (!(v.obs || '').trim() || v.obs === OBS_IMPORT_PADRAO)) patch.obs = obs;
-        if (v.status === 'Agendada' && (patch.data || v.data) < today) patch.status = 'Realizada';
+        const patch = patchDaAgenda(v,ev,today);
         if (!Object.keys(patch).length) return 'skipped';
         tx.update(ref, patch); return 'updated';
       }
@@ -570,7 +576,7 @@ function visitaAtingiuHorario(v, now = Date.now()) {
 }
 
 async function concluirVisitasPorHorario(db, now = Date.now()) {
-  const snap = await db.collection('visits').get();
+  const snap = await db.collection('visits').where('status','==','Agendada').get();
   let count = 0;
   for (const snapshot of snap.docs) {
     if (!visitaAtingiuHorario(snapshot.data(), now)) continue;
@@ -600,9 +606,10 @@ async function main() {
     // Se a leitura da fila de exclusões falhar, o ciclo para: importar sem ela recriaria exclusões.
     del = await processDeletions(db, accessToken);
     del.excluidosIds.forEach(key => eventById.delete(key));
-    const reconciliation = await reconcileGoogleDeletions(db, accessToken, eventById);
+    const visitsSnapshot = await db.collection('visits').get();
+    const reconciliation = await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot);
     push = await pushPendingVisits(db, accessToken, eventById);
-    const result = await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta });
+    const result = await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta, visitsSnapshot });
     result.realizadasPorHorario = await concluirVisitasPorHorario(db);
     const pending = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
     const deletionQueue = await db.collection('googleDeletions').get();
