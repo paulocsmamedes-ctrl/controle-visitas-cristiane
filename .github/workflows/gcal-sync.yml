@@ -2,20 +2,18 @@ name: Sincronizar Google Agenda
 
 on:
   schedule:
-    # A cada 10 minutos, independente de navegador aberto.
-    #
-    # Só é sustentável porque este repositório é PÚBLICO: nesse caso o GitHub
-    # Actions é gratuito e ilimitado, e o consumo não desconta da cota de 2.000
-    # minutos/mês. Se um dia o repositório voltar a ser privado, este cron precisa
-    # voltar para '*/30' — em privado, 10 minutos dá ~4.400 execuções/mês (cada
-    # uma cobrada como 1 minuto cheio, mesmo levando 25 segundos) e estoura a
-    # cota antes da metade do mês, deixando a sincronização fora do ar.
+    # Rede de segurança a cada 10 minutos. O agendamento externo precisa ser
+    # conferido separadamente; não há garantia de prazo no agendador do GitHub.
+    # Não cancela um ciclo em andamento. O próximo disparo aguarda na fila.
     - cron: '*/10 * * * *'
   workflow_dispatch: {}       # permite rodar manualmente pela aba Actions do GitHub, para testar
 
 concurrency:
   group: gcal-sync
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   sync:
@@ -30,7 +28,11 @@ jobs:
 
       - name: Instalar dependências
         working-directory: server-sync
-        run: npm install --omit=dev
+        run: npm ci --omit=dev
+
+      - name: Testar sincronização
+        working-directory: server-sync
+        run: npm test
 
       - name: Rodar sincronização
         working-directory: server-sync

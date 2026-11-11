@@ -1,94 +1,60 @@
-# Sincronização automática via GitHub Actions
+# Operação da sincronização — revisão de 11/11/2026
 
-> ## ⚠️ AÇÃO NECESSÁRIA: regerar o refresh token (uma vez)
->
-> A sincronização agora é de **mão dupla** — o que é alterado no site é gravado de volta no
-> Google Agenda. Para isso o servidor precisa de permissão de **escrita**, e o refresh token
-> atual só tem permissão de leitura. **Enquanto este passo não for feito, a leitura
-> (Google → site) continua funcionando normalmente, mas nada do site chega na agenda.**
->
-> **Passo 1 — pegar as credenciais do OAuth Client "Desktop".**
-> No *Google Cloud Console → APIs e Serviços → Credenciais*, clique no OAuth Client do tipo
-> **Aplicativo para computador** e copie o ID do cliente e a chave secreta. (Se a chave não
-> aparecer na tela, use **Transferir JSON** e guarde o arquivo baixado.)
->
-> **Passo 2 — salvar em `server-sync/.oauth-client.json`** (já está no `.gitignore`):
-> ```json
-> {
->   "client_id": "....apps.googleusercontent.com",
->   "client_secret": "GOCSPX-..."
-> }
-> ```
-> O JSON baixado do próprio Google também serve, sem editar nada.
->
-> **Passo 3 — rodar o script:**
-> ```bash
-> node server-sync/get-refresh-token.js
-> ```
->
-> Ele abre o navegador sozinho. Faça login **com a conta da agenda** (`kris.noleto@gmail.com`),
-> não com outra — o token fica preso na conta que autorizar. Aceite **todas** as permissões
-> pedidas, inclusive a de gerenciar/editar os eventos.
->
-> O resto é automático: o script confere se a permissão de escrita foi mesmo concedida,
-> grava o refresh token direto no GitHub Secret `GOOGLE_REFRESH_TOKEN` (via `gh`, sem o token
-> passar pela tela ou pelo histórico do shell) e dispara uma sincronização de teste.
->
-> Se algo falhar, ele diz exatamente o quê — inclusive o caso em que o Google concede só
-> leitura. E enquanto o token não tiver escopo de escrita, o próprio site mostra o aviso na
-> aba **Google Agenda**, em vez de o erro ficar escondido no log do Actions.
+O código desta pasta sincroniza Google Agenda e Firestore pelo GitHub Actions. A interface vigente fica em `../Site 2 Cristiane`; o HTML antigo desta pasta é arquivo de consulta e não deve ser publicado. O estado dos serviços externos não foi verificado nesta revisão.
 
+## Comportamento corrigido
 
+- Somente o servidor importa eventos para o CRM. O navegador lê a agenda para visualização e registra alterações locais com `pendingGoogleSync`.
+- Os calendários são paginados integralmente e a conta principal do token é conferida antes de envios ou importação.
+- Um evento ausente na janela 2025–2035 nunca autoriza apagar histórico. Exclusões do Google são pedidos explícitos feitos no CRM.
+- Uma alteração enviada só é confirmada se a versão do documento não mudou. Uma nova edição permanece pendente.
+- Eventos enviados neste ciclo não são reimportados da leitura anterior ao envio.
+- Criações no Google usam ID estável por visita. Após interrupção, uma resposta 409 é reconciliada, sem criar outro evento.
+- Importações usam ID estável por calendário/evento e transações; documentos antigos compatíveis são reaproveitados sem renumeração.
+- Pedidos de exclusão confirmados mantêm recibo `completedAt`, protegendo contra recriação por leituras antigas. Não apagar esses recibos sem um plano de retenção e recuperação.
+- Falhas HTTP temporárias têm novas tentativas limitadas e tempo máximo de requisição.
 
-Isso é o "plano B" caso o teste de deixar o app aberto com a tela apagada não seja suficiente
-(ex: precisa funcionar com o celular bloqueado, ou o computador desligado). Roda inteiramente
-no servidor do GitHub, de graça, sem depender de nenhum navegador aberto.
+## Configuração
 
-Nada disto está ativo ainda — os arquivos só estão prontos para quando vocês decidirem ligar.
+Secrets existentes: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` e `FIREBASE_SERVICE_ACCOUNT_JSON`.
 
-## Passo a passo para ativar (feito uma única vez)
+O token deve ter os escopos `calendar.events` e `calendar.readonly`. A conta esperada está definida em `sync.js`. Uma mudança deliberada de conta exige revisar também a configuração da interface e migrar os vínculos; não basta substituir o token. `GOOGLE_CALENDAR_OWNER` permite configurar a conta no processo do servidor quando essa migração for planejada.
 
-1. **Criar um repositório no GitHub** (pode ser privado) e subir esta pasta do projeto para lá.
+`get-refresh-token.js` é ferramenta manual e tem efeitos externos: abre autorização, atualiza o GitHub Secret e dispara workflow. Não executá-lo como teste de código. O fluxo preferido não imprime o token; se o GitHub CLI falhar, existe fallback local em arquivo `.secret`, que deve ser tratado como credencial.
 
-2. **Criar um novo OAuth Client no Google Cloud Console**, tipo **"Desktop app"** (diferente do
-   Client ID "Web" que o `controle-visitas.html` já usa) — em *APIs e Serviços → Credenciais →
-   Criar credenciais → ID do cliente OAuth → Tipo: Aplicativo para computador*. Guarde o Client ID
-   e o Client Secret gerados.
+## Testes
 
-3. **Gerar o refresh token, uma única vez, rodando localmente:**
-   ```bash
-   cd server-sync
-   npm install
-   GOOGLE_CLIENT_ID=xxx GOOGLE_CLIENT_SECRET=yyy node get-refresh-token.js
-   ```
-   Abra a URL impressa no terminal, faça login com a conta Google onde está a agenda a sincronizar,
-   aceite a permissão. O terminal imprime o `refresh_token` — copie e guarde, ele só aparece uma vez.
+Na pasta `server-sync`:
 
-4. **Gerar a chave da conta de serviço do Firebase** — Console do Firebase → ⚙️ Configurações do
-   projeto → Contas de serviço → **Gerar nova chave privada**. Baixa um arquivo `.json`.
+```powershell
+npm test
+```
 
-5. **No repositório do GitHub → Settings → Secrets and variables → Actions → New repository secret**,
-   cadastrar 4 segredos:
-   - `GOOGLE_CLIENT_ID` — o Client ID do passo 2
-   - `GOOGLE_CLIENT_SECRET` — o Client Secret do passo 2
-   - `GOOGLE_REFRESH_TOKEN` — o token do passo 3
-   - `FIREBASE_SERVICE_ACCOUNT_JSON` — o conteúdo **inteiro** do arquivo `.json` do passo 4 (colar como texto)
+Os testes usam banco em memória e HTTP simulado; não acessam produção. O workflow executa os testes antes da sincronização. `npm ci --omit=dev` usa o lockfile.
 
-6. Pronto. O workflow em `.github/workflows/gcal-sync.yml` já está agendado para rodar a cada
-   30 minutos assim que os secrets existirem. Para testar sem esperar, vá na aba **Actions** do
-   repositório → "Sincronizar Google Agenda" → **Run workflow**.
+## Agendamento e diagnóstico
 
-## O que esse script faz
+O cron local está mantido em `*/10`, sem garantia de prazo exato. O disparador no cron-job.org precisa ser conferido em sua conta; sua configuração não é comprovada pelo código. Execuções novas aguardam o ciclo em andamento em vez de cancelá-lo.
 
-`sync.js` replica exatamente a mesma lógica de importação que o `controle-visitas.html` já usa
-no navegador (mesmos filtros de calendário, mesmo critério de "é uma visita" pelo título, mesmos
-campos gravados) — só que rodando no servidor do GitHub, então funciona independente de qualquer
-navegador ou dispositivo estar ligado. Grava direto na mesma coleção `visits` do Firestore que o
-app já lê em tempo real — o app não precisa saber que a sincronização rodou em outro lugar.
+`meta/googleSync` registra:
 
-## Segurança
+- `status`: running, ok, partial ou error;
+- `lastAttemptAt`: início de uma tentativa;
+- `lastSyncedAt`: último ciclo que terminou a fase de importação;
+- `lastSuccessfulAt`: último ciclo completo sem pendências/falhas;
+- `writeScopeError` e `lastError`: problemas conhecidos;
+- `lastImport`: contagens, pendências e completude da leitura.
 
-`GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` e a chave da conta de serviço do Firebase são
-segredos de verdade — nunca cole eles no `controle-visitas.html` nem em nenhum arquivo commitado
-no repositório. Eles só devem existir dentro dos **GitHub Secrets** (criptografados, não aparecem
-nos logs do workflow).
+Horário recente de leitura não prova que todos os envios terminaram. Se um job for interrompido pelo limite de tempo, o estado pode permanecer running; a interface só o apresenta como execução recente por dois minutos e sinaliza atraso pelo horário do último ciclo.
+
+## Publicação coordenada
+
+As mudanças locais não entram em produção sozinhas. Revisar o diff, publicar o sincronizador/workflow no repositório correto e verificar um ciclo real; testar o frontend em canal de prévia antes de promover o hosting. Recarregar as abas antigas após a troca para que não continuem executando o importador antigo. Não publicar `firestore.rules` da pasta Site 2, marcado como obsoleto. As regras válidas continuam nesta pasta e não foram modificadas nesta correção.
+
+Não foram removidas duplicações antigas nem migrados dados de produção. Se houver duplicações preexistentes, revisar os vínculos antes de qualquer limpeza.
+
+## Exclusões feitas no Google — ajuste de 11/11/2026
+
+O servidor consulta diretamente eventos vinculados que ficaram ausentes da leitura. Resposta com status cancelled ou HTTP 410 marca googleCalendarState=deleted e registra googleDeletedAt, sem apagar cliente, observações ou alterar status comercial. HTTP 404 marca unavailable, pois também pode significar falta de acesso. Falhas 403/rede não confirmam exclusão. Um evento restaurado passa para active e a etiqueta é removida.
+
+Edições locais pendentes de um evento com exclusão confirmada são preservadas, sem recriar o compromisso no Google. A visita permanece no histórico, com etiqueta na tabela; sai da agenda de próximos compromissos e não dispara avanço automático de prazo.

@@ -4,7 +4,8 @@
   "type": "commonjs",
   "scripts": {
     "get-refresh-token": "node get-refresh-token.js",
-    "sync": "node sync.js"
+    "sync": "node sync.js",
+    "test": "node --test test/*.test.cjs"
   },
   "dependencies": {
     "firebase-admin": "^12.6.0"
