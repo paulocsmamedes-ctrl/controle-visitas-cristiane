@@ -345,6 +345,19 @@ async function recordPushError(db, snapshot, message) {
 
 // Somente cancelamento explícito ou HTTP 410 confirma exclusão. Um 404 pode
 // também significar acesso insuficiente: ele aparece como indisponível, sem apagar dados.
+async function settleDeletedVisit(db, snapshot) {
+  return db.runTransaction(async tx => {
+    const current = await tx.get(snapshot.ref);
+    if (!current.exists || !sameVersion(current, snapshot)) return false;
+    const v = current.data();
+    if (v.finalizadaPorExclusao && v.googleCalendarState === 'deleted' && !v.pendingGoogleSync && !v.googleSyncError) return false;
+    const patch = {googleCalendarState:'deleted',pendingGoogleSync:false,googleSyncError:null,googleDeletionRequested:false,googleSyncDisposition:'local-only-deleted'};
+    if (!v.googleDeletedAt) patch.googleDeletedAt = admin.firestore.FieldValue.serverTimestamp();
+    if (!v.finalizadaPorExclusao) Object.assign(patch, {status:'Atendimento finalizado',statusAntesDaExclusao:v.status || '',statusEm:todayISO(),finalizadaPorExclusao:true});
+    tx.update(snapshot.ref,patch);return true;
+  });
+}
+
 async function reconcileGoogleDeletions(db, accessToken, eventById) {
   const visits = await db.collection('visits').get();
   let marked = 0, restored = 0, unavailable = 0, failed = 0;
@@ -362,7 +375,8 @@ async function reconcileGoogleDeletions(db, accessToken, eventById) {
       else { failed++; continue; }
     }
     // Não reduz uma exclusão já confirmada a uma ausência ambígua em ciclos seguintes.
-    if (state === 'unavailable' && v.googleCalendarState === 'deleted') continue;
+    if (state === 'unavailable' && v.googleCalendarState === 'deleted') state = 'deleted';
+    if (state === 'deleted') { if (await settleDeletedVisit(db,snapshot)) marked++; continue; }
     if (state === 'unavailable') unavailable++;
     if ((v.googleCalendarState || 'active') === state) continue;
     const changed = await db.runTransaction(async tx => {
@@ -389,8 +403,7 @@ async function pushPendingVisits(db, accessToken, eventById) {
     const v = { ...snapshot.data(), id: snapshot.id };
     try {
       if (v.googleCalendarState === 'deleted') {
-        adiados++;
-        await recordPushError(db, snapshot, 'Evento excluído no Google. A edição foi preservada no CRM e não recriará o compromisso.');
+        await settleDeletedVisit(db, snapshot);
         continue;
       }
       // Uma exclusão confirmada no CRM não pode ser desfeita por um envio já em andamento.
@@ -472,7 +485,12 @@ async function processDeletions(db, accessToken) {
       // Não remove um pedido novo que tenha substituído este durante a chamada HTTP.
       await db.runTransaction(async tx => {
         const current = await tx.get(snapshot.ref);
-        if (current.exists && sameVersion(current, snapshot)) tx.update(snapshot.ref, { completedAt: admin.firestore.FieldValue.serverTimestamp() });
+        const visitRef = t.visitId ? db.collection('visits').doc(t.visitId) : null;
+        const visit = visitRef ? await tx.get(visitRef) : null;
+        if (current.exists && sameVersion(current, snapshot)) {
+          tx.update(snapshot.ref, { completedAt: admin.firestore.FieldValue.serverTimestamp() });
+          if (visit?.exists) tx.update(visitRef, {googleCalendarState:'deleted',googleDeletedAt:admin.firestore.FieldValue.serverTimestamp(),googleDeletionRequested:false,pendingGoogleSync:false,googleSyncError:null});
+        }
       });
       excluidos++;
     } catch (e) {
@@ -581,6 +599,7 @@ async function main() {
     let push = { enviados: 0, criados: 0, falhas: 0, adiados: 0, descartados: 0, protegidos: new Set(), scopeError: null };
     // Se a leitura da fila de exclusões falhar, o ciclo para: importar sem ela recriaria exclusões.
     del = await processDeletions(db, accessToken);
+    del.excluidosIds.forEach(key => eventById.delete(key));
     const reconciliation = await reconcileGoogleDeletions(db, accessToken, eventById);
     push = await pushPendingVisits(db, accessToken, eventById);
     const result = await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta });
@@ -610,5 +629,5 @@ async function main() {
 if (require.main === module) {
   main().catch(err => { console.error('Sincronização falhou:', err.message); process.exitCode = 1; });
 }
-module.exports = { visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
+module.exports = { settleDeletedVisit, visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
   importedVisitId, createdEventId, reconcileGoogleDeletions, acknowledgePush, pushPendingVisits, processDeletions, importGoogleEventsIntoVisits };

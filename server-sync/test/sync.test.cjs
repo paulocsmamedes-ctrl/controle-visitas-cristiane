@@ -96,7 +96,7 @@ test('exclusão confirmada mantém recibo e não apaga pedido de proteção',asy
 });
 
 test('cancelamento confirmado no Google marca exclusão sem apagar cliente e notas',async()=>{
- const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',status:'Realizada',cliente:'Cliente',obs:'Histórico preservado'}});mockFetch(async()=>response({id:'e1',status:'cancelled'}));const result=await api.reconcileGoogleDeletions(db,'token',new Map());const v=db.snapshot('visits/v1').data();assert.equal(result.marked,1);assert.equal(v.googleCalendarState,'deleted');assert.equal(v.status,'Realizada');assert.equal(v.obs,'Histórico preservado');assert.equal(v.cliente,'Cliente');
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',status:'Realizada',cliente:'Cliente',obs:'Histórico preservado'}});mockFetch(async()=>response({id:'e1',status:'cancelled'}));const result=await api.reconcileGoogleDeletions(db,'token',new Map());const v=db.snapshot('visits/v1').data();assert.equal(result.marked,1);assert.equal(v.googleCalendarState,'deleted');assert.equal(v.status,'Atendimento finalizado');assert.equal(v.statusAntesDaExclusao,'Realizada');assert.equal(v.obs,'Histórico preservado');assert.equal(v.cliente,'Cliente');
 });
 test('404 marca evento indisponível, sem afirmar exclusão',async()=>{
  const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita'}});mockFetch(async()=>response({error:{message:'not found'}},404));await api.reconcileGoogleDeletions(db,'token',new Map());assert.equal(db.snapshot('visits/v1').data().googleCalendarState,'unavailable');assert.equal(db.snapshot('visits/v1').data().googleDeletedAt,undefined);
@@ -111,7 +111,7 @@ test('evento fora da janela mas existente não é marcado como excluído',async(
  const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',data:'2040-01-01'}});mockFetch(async()=>response({id:'e1',status:'confirmed',start:{date:'2040-01-01'}}));await api.reconcileGoogleDeletions(db,'token',new Map());assert.equal(db.snapshot('visits/v1').data().googleCalendarState,undefined);
 });
 test('edição pendente de evento excluído não recria compromisso',async()=>{
- const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',googleCalendarState:'deleted',pendingGoogleSync:true,obs:'Edição local'}});let calls=0;mockFetch(async()=>{calls++;return response({})});await api.pushPendingVisits(db,'token',new Map());assert.equal(calls,0);assert.equal(db.snapshot('visits/v1').data().pendingGoogleSync,true);assert.equal(db.snapshot('visits/v1').data().obs,'Edição local');
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',googleCalendarState:'deleted',pendingGoogleSync:true,obs:'Edição local'}});let calls=0;mockFetch(async()=>{calls++;return response({})});await api.pushPendingVisits(db,'token',new Map());assert.equal(calls,0);assert.equal(db.snapshot('visits/v1').data().pendingGoogleSync,false);assert.equal(db.snapshot('visits/v1').data().status,'Atendimento finalizado');assert.equal(db.snapshot('visits/v1').data().obs,'Edição local');
 });
 test('404 posterior não desfaz exclusão já confirmada',async()=>{
  const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',googleCalendarState:'deleted'}});mockFetch(async()=>response({error:{message:'not found'}},404));await api.reconcileGoogleDeletions(db,'token',new Map());assert.equal(db.snapshot('visits/v1').data().googleCalendarState,'deleted');
@@ -132,4 +132,8 @@ test('importação persiste horário e conclusão automática é idempotente',as
  assert.equal(snap.docs[0].data().googleStartAt,ev.raw.start.dateTime);
  await ref.update({status:'Agendada'});const time=Date.parse(ev.raw.start.dateTime);
  assert.equal(await api.concluirVisitasPorHorario(db,time),1);assert.equal(await api.concluirVisitasPorHorario(db,time),0);assert.equal((await ref.get()).data().status,'Realizada');
+});
+
+test('edição posterior à exclusão permanece local e limpa fila sem perder a observação',async()=>{
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',status:'Atendimento finalizado',finalizadaPorExclusao:true,googleCalendarState:'deleted',pendingGoogleSync:true,googleSyncError:'antigo',obs:'Nota nova'}});let calls=0;mockFetch(async()=>{calls++;return response({})});await api.pushPendingVisits(db,'token',new Map());const v=db.snapshot('visits/v1').data();assert.equal(calls,0);assert.equal(v.pendingGoogleSync,false);assert.equal(v.googleSyncError,null);assert.equal(v.obs,'Nota nova');
 });
