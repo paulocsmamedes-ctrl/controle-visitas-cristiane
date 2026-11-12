@@ -2,6 +2,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const cota = require('./quota.cjs');
 const HOUR = 60 * 60 * 1000;
+// Ciclo completo a cada ~15 min (decisão de 12/11/2026). 14 min, e não 15, porque os
+// disparos de 5 em 5 min chegam com segundos de variação: com 15 exatos, um disparo
+// adiantado empurraria o completo para 20 min.
+const INTERVALO_COMPLETO_MS = 14 * 60 * 1000;
 function readState(file) {
   try { const value = JSON.parse(fs.readFileSync(file, 'utf8')); return value && typeof value === 'object' ? value : {}; }
   catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return {}; throw error; }
@@ -20,7 +24,7 @@ async function runControlled({ sync, file, now = Date.now(), report = () => {} }
     Object.assign(state, {uso, retryAfter:cota.proximaVirada(now), motivo:'orcamento'}); save();
     const result = {state:'budget_paused', retryAfter:state.retryAfter, motivo:'orcamento', uso}; report(result); return result;
   }
-  const horaDoCompleto = !Number.isFinite(state.lastFullSyncAt) || now - state.lastFullSyncAt >= HOUR;
+  const horaDoCompleto = !Number.isFinite(state.lastFullSyncAt) || now - state.lastFullSyncAt >= INTERVALO_COMPLETO_MS;
   const fullSync = horaDoCompleto && cota.cabeCicloCompleto(uso, state.custoCompleto, now);
   try {
     const outcome = await sync({fullSync, usoAnterior:uso, custoCompleto:state.custoCompleto || null, ultimoCompleto:Number.isFinite(state.lastFullSyncAt) ? state.lastFullSyncAt : null});
@@ -54,7 +58,7 @@ function report(result) {
     message = `Sincronização NÃO concluída: Firebase sem cota disponível. Nova tentativa após ${new Date(result.retryAfter).toISOString()}. As pendências permanecem preservadas.`;
     console.warn(`::warning::${message}`);
   } else {
-    message = `Ciclo ${result.fullSync ? 'com histórico completo' : 'de envio de pendências'}: ${result.state}. A importação e verificação de exclusões do Google ocorrem no ciclo completo, no máximo uma vez por hora.`;
+    message = `Ciclo ${result.fullSync ? 'com histórico completo' : 'de envio de pendências'}: ${result.state}. A importação e verificação de exclusões do Google ocorrem no ciclo completo, a cada ~15 min (o ritmo da cota pode espaçar).`;
     if (result.economia) message += ' Ciclo completo adiado para economizar a cota do dia.';
   }
   if (result.uso) message += ' ' + cota.resumoDoUso(result.uso);
@@ -65,4 +69,4 @@ if (require.main === module) {
   runControlled({sync:require('./sync.js').main, file:path.join(__dirname,'.sync-control/state.json'), report})
     .catch(error => { console.error('Sincronização falhou:', error.message); process.exitCode=1; });
 }
-module.exports = {runControlled};
+module.exports = {runControlled, INTERVALO_COMPLETO_MS};

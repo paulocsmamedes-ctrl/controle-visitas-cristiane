@@ -632,7 +632,7 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
     const desde = fullSync ? null : (Number.isFinite(ultimoCompleto) ? ultimoCompleto : Date.now()) - MARGEM_PEDIDO_EXCLUSAO_MS;
     del = await processDeletions(db, accessToken, { desde });
     del.excluidosIds.forEach(key => eventById.delete(key));
-    // O histórico completo é relido uma vez por hora; a fila continua em cada disparo.
+    // O histórico completo é relido a cada ~15 min; a fila continua em cada disparo.
     const visitsSnapshot = fullSync ? await db.collection('visits').get() : null;
     const reconciliation = fullSync ? await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot) : { marked:0, restored:0, unavailable:0, failed:0 };
     push = await pushPendingVisits(db, accessToken, eventById);

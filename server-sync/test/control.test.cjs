@@ -13,10 +13,11 @@ test('cota interrompe tentativas por uma hora e retoma após expiração', async
  assert.equal((await runControlled({sync,file,now:HOUR+1})).state,'paused');assert.equal(calls,1);
  assert.equal((await runControlled({sync,file,now:2*HOUR})).state,'quota_exceeded');assert.equal(calls,2);
 });
-test('ciclo frequente processa fila sem reler histórico; histórico volta após uma hora',async t=>{
+test('ciclo frequente processa fila sem reler histórico; histórico volta a cada ~15 min',async t=>{
  const file=fixture(t);const modes=[];const sync=async opts=>{modes.push(opts.fullSync);return {healthy:true,leituraCompleta:true}};
- for(const now of [HOUR,HOUR+300000,2*HOUR])await runControlled({sync,file,now});
- assert.deepEqual(modes,[true,false,true]);
+ // Disparos de 5 em 5 min com 1 s de adiantamento: o completo ainda sai no 3º disparo (~15 min).
+ const M=60000;for(const now of [HOUR,HOUR+5*M-1000,HOUR+10*M-2000,HOUR+15*M-3000,HOUR+20*M])await runControlled({sync,file,now});
+ assert.deepEqual(modes,[true,false,false,true,false]);
 });
 test('ciclo incompleto não confirma importação completa e erros inesperados continuam falhando',async t=>{
  const file=fixture(t);await runControlled({file,now:HOUR,sync:async()=>({healthy:false,leituraCompleta:false})});

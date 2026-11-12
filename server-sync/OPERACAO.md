@@ -3,7 +3,7 @@
 O GitHub executa `node run-sync.cjs`. O controle guarda apenas `lastFullSyncAt` e `retryAfter` no cache de Actions; não armazena clientes, eventos ou credenciais.
 
 - Disparos frequentes continuam enviando edições/exclusões do CRM e concluindo visitas pelo horário, quando o Firebase permite acesso.
-- Importação e reconciliação completa de exclusões do Google são executadas uma vez por hora após um ciclo completo saudável. Essa opção reduz as leituras do histórico, mas pode atrasar a chegada de alterações do Google ao CRM em até uma hora, além dos atrasos do agendador.
+- Importação e reconciliação completa de exclusões do Google são executadas a cada ~15 min após um ciclo completo saudável (decisão de 12/11/2026; custo medido: 80 leituras por completo, ~8.700 leituras/dia). Alterações do Google chegam ao CRM em até ~15 min, além dos atrasos do agendador. Se a cota apertar, o ritmo do orçamento espaça o completo sozinho.
 - Código Firestore 8 (RESOURCE_EXHAUSTED) inicia pausa de uma hora. Durante a pausa não se acessa o Firebase. O horário de nova tentativa fica no resumo do Actions.
 - Uma execução verde com aviso de cota significa que o controle de pausa funcionou; NÃO confirma sincronização, fila zerada ou recuperação da cota. Verificar o resumo e meta/googleSync depois de um ciclo completo bem-sucedido.
 - Erros de autenticação, permissão, testes e demais falhas continuam encerrando a execução com erro.
