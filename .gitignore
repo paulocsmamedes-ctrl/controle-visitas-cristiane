@@ -6,3 +6,6 @@ node_modules/
 .oauth-client.json
 **/.oauth-client.json
 *.secret
+
+# Controle local de cota e intervalo de sincronização
+server-sync/.sync-control/

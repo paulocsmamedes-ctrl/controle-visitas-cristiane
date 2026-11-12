@@ -455,6 +455,7 @@ async function pushPendingVisits(db, accessToken, eventById) {
         criados++;
       }
     } catch (e) {
+      if (Number(e.code) === 8) throw e;
       falhas++;
       try { await recordPushError(db, snapshot, String(e.message)); } catch (recordError) { console.error('Falha ao registrar pendência:', recordError.message); }
       if (e instanceof ScopeError) { scopeError = e.message; break; }
@@ -494,6 +495,7 @@ async function processDeletions(db, accessToken) {
       });
       excluidos++;
     } catch (e) {
+      if (Number(e.code) === 8) throw e;
       falhas++;
       if (e instanceof ScopeError) { scopeError = e.message; break; }
     }
@@ -591,7 +593,7 @@ async function concluirVisitasPorHorario(db, now = Date.now()) {
   return count;
 }
 
-async function main() {
+async function main({ fullSync = true } = {}) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   const db = admin.firestore();
@@ -606,10 +608,12 @@ async function main() {
     // Se a leitura da fila de exclusões falhar, o ciclo para: importar sem ela recriaria exclusões.
     del = await processDeletions(db, accessToken);
     del.excluidosIds.forEach(key => eventById.delete(key));
-    const visitsSnapshot = await db.collection('visits').get();
-    const reconciliation = await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot);
+    // O histórico completo é relido uma vez por hora; a fila continua em cada disparo.
+    const visitsSnapshot = fullSync ? await db.collection('visits').get() : null;
+    const reconciliation = fullSync ? await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot) : { marked:0, restored:0, unavailable:0, failed:0 };
     push = await pushPendingVisits(db, accessToken, eventById);
-    const result = await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta, visitsSnapshot });
+    const result = fullSync ? await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta, visitsSnapshot }) : { imported:0, updated:0, skipped:0, removed:0, totalEvents:events.length, leituraCompleta };
+    result.fullSync = fullSync;
     result.realizadasPorHorario = await concluirVisitasPorHorario(db);
     const pending = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
     const deletionQueue = await db.collection('googleDeletions').get();
@@ -621,14 +625,17 @@ async function main() {
       excluidasNaAgenda: reconciliation.marked, restauradasNaAgenda: reconciliation.restored,
       naoLocalizadasNaAgenda: reconciliation.unavailable, falhasDeVerificacao: reconciliation.failed });
     const healthy = leituraCompleta && !writeScopeError && !result.falhasDeEnvio && !result.pendentes && !result.exclusoesPendentes && !result.falhasDeVerificacao;
-    const metadata = { lastSyncedAt: admin.firestore.FieldValue.serverTimestamp(), lastImport: result,
+    const metadata = { lastCycleAt: admin.firestore.FieldValue.serverTimestamp(), lastCycle: result,
       writeScopeError, lastError: null, status: healthy ? 'ok' : 'partial', source: 'github-actions', porCalendario };
-    if (healthy) metadata.lastSuccessfulAt = admin.firestore.FieldValue.serverTimestamp();
+    if (fullSync) { metadata.lastSyncedAt = admin.firestore.FieldValue.serverTimestamp(); metadata.lastImport = result; }
+    if (healthy && fullSync) metadata.lastSuccessfulAt = admin.firestore.FieldValue.serverTimestamp();
     await meta.set(metadata, { merge: true });
     console.log('Ciclo finalizado:', JSON.stringify(result));
     if (!healthy) console.warn('Sincronização parcial; consulte meta/googleSync e as pendências no CRM.');
+    return { healthy, fullSync, leituraCompleta };
   } catch (e) {
-    await meta.set({ status: 'error', lastError: String(e.message).slice(0, 300) }, { merge: true }).catch(() => {});
+    // A cota já bloqueou o banco: não insistir numa segunda escrita de erro.
+    if (Number(e.code) !== 8) await meta.set({ status: 'error', lastError: String(e.message).slice(0, 300) }, { merge: true }).catch(() => {});
     throw e;
   }
 }

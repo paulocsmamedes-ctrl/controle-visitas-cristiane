@@ -20,11 +20,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
+
+      # Apenas horários de controle; nenhum evento, cliente ou segredo no cache.
+      - name: Recuperar controle de cota e leitura completa
+        uses: actions/cache/restore@v5
+        with:
+          path: server-sync/.sync-control
+          key: sync-control-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: sync-control-v1-
 
       - name: Instalar dependências
         working-directory: server-sync
@@ -41,4 +49,11 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
-        run: npm run sync
+        run: node run-sync.cjs
+
+      - name: Preservar controle para o próximo disparo
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: server-sync/.sync-control
+          key: sync-control-v1-${{ github.run_id }}-${{ github.run_attempt }}
