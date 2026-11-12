@@ -16,6 +16,7 @@
  */
 const admin = require('firebase-admin');
 const { createHash } = require('node:crypto');
+const cota = require('./quota.cjs');
 let primaryCalendarId = 'primary';
 const EXPECTED_CALENDAR_OWNER = (process.env.GOOGLE_CALENDAR_OWNER || 'kris.noleto@gmail.com').trim().toLowerCase();
 function calendarKey(id) { return id === 'primary' ? primaryCalendarId : id; }
@@ -593,12 +594,23 @@ async function concluirVisitasPorHorario(db, now = Date.now()) {
   return count;
 }
 
-async function main({ fullSync = true } = {}) {
+async function main({ fullSync = true, usoAnterior = null, custoCompleto = null } = {}) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   const db = admin.firestore();
   const meta = db.collection('meta').doc('googleSync');
+  const medidor = cota.medirFirestore(admin.firestore);
+  let usoBase = cota.usoDeHoje(usoAnterior);
+  const usoAtual = (extra = {}) => cota.somarUso(usoBase, { leituras: medidor.contador.leituras + (extra.leituras || 0), gravacoes: medidor.contador.gravacoes + (extra.gravacoes || 0) });
   try {
+    // O contador gravado no banco sobrevive à perda do cache do Actions.
+    const anterior = await meta.get();
+    usoBase = cota.maiorUso(usoBase, anterior.exists ? anterior.data().cotaDoSync : null);
+    if (cota.esgotado(usoBase)) {
+      console.warn(cota.resumoDoUso(usoAtual()));
+      return { healthy: false, fullSync: false, leituraCompleta: false, orcamentoEsgotado: true, uso: usoAtual(), custoCiclo: { ...medidor.contador } };
+    }
+    if (fullSync && !cota.cabeCicloCompleto(usoBase, custoCompleto)) { fullSync = false; console.warn('Orçamento diário acima de ' + Math.round(cota.FAIXA_COMPLETO * 100) + '%: ciclo só de envio de pendências.'); }
     await meta.set({ lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(), status: 'running' }, { merge: true });
     const accessToken = await getFreshAccessToken();
     const { events, calendarsCount, leituraCompleta, porCalendario } = await fetchGoogleEvents(accessToken);
@@ -629,14 +641,22 @@ async function main({ fullSync = true } = {}) {
       writeScopeError, lastError: null, status: healthy ? 'ok' : 'partial', source: 'github-actions', porCalendario };
     if (fullSync) { metadata.lastSyncedAt = admin.firestore.FieldValue.serverTimestamp(); metadata.lastImport = result; }
     if (healthy && fullSync) metadata.lastSuccessfulAt = admin.firestore.FieldValue.serverTimestamp();
+    // Conta a própria gravação deste registro.
+    metadata.cotaDoSync = { ...usoAtual({ gravacoes: 1 }), limiteLeituras: cota.LIMITE.leituras, limiteGravacoes: cota.LIMITE.gravacoes };
+    result.custoDoCiclo = { leituras: medidor.contador.leituras, gravacoes: medidor.contador.gravacoes + 1 };
+    metadata.lastCycle = result;
     await meta.set(metadata, { merge: true });
     console.log('Ciclo finalizado:', JSON.stringify(result));
+    console.log(cota.resumoDoUso(usoAtual()));
     if (!healthy) console.warn('Sincronização parcial; consulte meta/googleSync e as pendências no CRM.');
-    return { healthy, fullSync, leituraCompleta };
+    return { healthy, fullSync, leituraCompleta, uso: usoAtual(), custoCiclo: { ...medidor.contador } };
   } catch (e) {
     // A cota já bloqueou o banco: não insistir numa segunda escrita de erro.
     if (Number(e.code) !== 8) await meta.set({ status: 'error', lastError: String(e.message).slice(0, 300) }, { merge: true }).catch(() => {});
+    e.uso = usoAtual();
     throw e;
+  } finally {
+    medidor.desligar();
   }
 }
 

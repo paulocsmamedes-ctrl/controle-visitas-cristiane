@@ -27,5 +27,7 @@ test('ciclo incompleto não confirma importação completa e erros inesperados c
 test('sucesso após cota limpa pausa e não grava dados de clientes no controle',async t=>{
  const file=fixture(t);fs.writeFileSync(file,JSON.stringify({retryAfter:HOUR}));
  await runControlled({file,now:HOUR,sync:async()=>({healthy:true,leituraCompleta:true})});
- assert.deepEqual(JSON.parse(fs.readFileSync(file)),{lastFullSyncAt:HOUR});
+ const salvo=JSON.parse(fs.readFileSync(file));
+ assert.equal(salvo.lastFullSyncAt,HOUR);assert.equal(salvo.retryAfter,undefined);
+ assert.deepEqual(Object.keys(salvo).filter(k=>!['lastFullSyncAt','uso','custoCompleto'].includes(k)),[]);
 });
