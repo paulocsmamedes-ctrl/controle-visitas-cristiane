@@ -24,9 +24,9 @@ test('uso de outro dia vale zero e duas fontes se juntam pelo maior valor', () =
 
 test('orçamento é metade da cota grátis e ciclo completo só cabe abaixo de 80%', () => {
   assert.deepEqual({...cota.LIMITE}, {leituras:25000,gravacoes:10000});
-  const dia = '2026-11-11';
-  assert.equal(cota.cabeCicloCompleto({dia,leituras:16000,gravacoes:0},{leituras:3000,gravacoes:10},NOITE), true);
-  assert.equal(cota.cabeCicloCompleto({dia,leituras:17500,gravacoes:0},{leituras:3000,gravacoes:10},NOITE), false);
+  const dia = '2026-11-11', FIM = Date.UTC(2026,10,12,7,30); // 23:30 no Pacífico
+  assert.equal(cota.cabeCicloCompleto({dia,leituras:16000,gravacoes:0},{leituras:3000,gravacoes:10},FIM), true);
+  assert.equal(cota.cabeCicloCompleto({dia,leituras:17500,gravacoes:0},{leituras:3000,gravacoes:10},FIM), false);
   assert.equal(cota.esgotado({dia,leituras:24999,gravacoes:0},NOITE), false);
   assert.equal(cota.esgotado({dia,leituras:0,gravacoes:10000},NOITE), true);
 });
@@ -84,4 +84,15 @@ test('estouro real da cota guarda o uso medido até o erro', async t => {
   const r = await runControlled({file,now:NOITE,sync:async()=>{throw Object.assign(new Error('Quota exceeded'),{code:8,uso:{dia:'2026-11-11',leituras:700,gravacoes:3}})}});
   assert.equal(r.state,'quota_exceeded'); assert.equal(r.motivo,'cota');
   assert.equal(JSON.parse(fs.readFileSync(file)).uso.leituras,700);
+});
+
+test('ritmo espalha o ciclo completo pelas 24 h do dia da cota', () => {
+  const dia = '2026-11-11', custo = {leituras:3000,gravacoes:10};
+  const h = horaPT => Date.UTC(2026,10,11,8+horaPT,0);
+  assert.ok(Math.abs(cota.fracaoDoDia(h(6)) - 0.25) < 1e-9);
+  // 06h no Pacífico: permitido 20.000 x (6+2)/24 = 6.667 leituras acumuladas.
+  assert.equal(cota.cabeCicloCompleto({dia,leituras:3500,gravacoes:0},custo,h(6)), true);
+  assert.equal(cota.cabeCicloCompleto({dia,leituras:4000,gravacoes:0},custo,h(6)), false);
+  // O mesmo gasto volta a caber mais tarde no dia.
+  assert.equal(cota.cabeCicloCompleto({dia,leituras:4000,gravacoes:0},custo,h(12)), true);
 });

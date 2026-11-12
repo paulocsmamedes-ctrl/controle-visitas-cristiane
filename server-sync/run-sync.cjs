@@ -23,7 +23,7 @@ async function runControlled({ sync, file, now = Date.now(), report = () => {} }
   const horaDoCompleto = !Number.isFinite(state.lastFullSyncAt) || now - state.lastFullSyncAt >= HOUR;
   const fullSync = horaDoCompleto && cota.cabeCicloCompleto(uso, state.custoCompleto, now);
   try {
-    const outcome = await sync({fullSync, usoAnterior:uso, custoCompleto:state.custoCompleto || null});
+    const outcome = await sync({fullSync, usoAnterior:uso, custoCompleto:state.custoCompleto || null, ultimoCompleto:Number.isFinite(state.lastFullSyncAt) ? state.lastFullSyncAt : null});
     delete state.retryAfter;
     const fezCompleto = outcome?.fullSync ?? fullSync;
     if (outcome?.uso) state.uso = cota.usoDeHoje(outcome.uso, now);

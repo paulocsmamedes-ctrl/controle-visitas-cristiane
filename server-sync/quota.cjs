@@ -6,7 +6,8 @@
 // sync não enxerga esse gasto. Por isso o sync só pode usar metade de cada limite.
 //
 // Faixas do orçamento do sync:
-//   - ciclo completo (relê o histórico) só se ainda couber inteiro abaixo de 80%;
+//   - ciclo completo (relê o histórico) só se couber abaixo de 80%, no ritmo das
+//     horas já passadas do dia (o gasto se espalha pelas 24 h);
 //   - acima disso, só envia pendências do CRM e conclui visitas pelo horário;
 //   - em 100%, não toca no Firebase até a virada do dia da cota.
 const COTA_GRATIS = Object.freeze({ leituras: 50000, gravacoes: 20000 });
@@ -54,11 +55,24 @@ function esgotado(uso, now = Date.now()) {
   return u.leituras >= LIMITE.leituras || u.gravacoes >= LIMITE.gravacoes;
 }
 
+const DIA_MS = 24 * 60 * 60 * 1000;
+const FOLGA_RITMO_MS = 2 * 60 * 60 * 1000;
+
+// Fração do dia da cota já passada (0 à meia-noite do Pacífico, 1 na virada seguinte).
+function fracaoDoDia(now = Date.now()) {
+  const fim = proximaVirada(now);
+  return Math.min(1, Math.max(0, 1 - (fim - now) / DIA_MS));
+}
+
+// Ritmo: o ciclo completo só roda se o gasto acumulado ficar dentro da parte do
+// orçamento proporcional às horas já passadas (mais 2 h de folga). Assim o gasto
+// se espalha pelas 24 h e a cota não acaba de madrugada deixando a noite parada.
 function cabeCicloCompleto(uso, custo, now = Date.now()) {
   const u = usoDeHoje(uso, now);
   const c = { ...CUSTO_COMPLETO_PADRAO, ...(custo || {}) };
-  return u.leituras + c.leituras <= LIMITE.leituras * FAIXA_COMPLETO &&
-    u.gravacoes + c.gravacoes <= LIMITE.gravacoes * FAIXA_COMPLETO;
+  const ritmo = Math.min(1, fracaoDoDia(now) + FOLGA_RITMO_MS / DIA_MS);
+  return u.leituras + c.leituras <= LIMITE.leituras * FAIXA_COMPLETO * ritmo &&
+    u.gravacoes + c.gravacoes <= LIMITE.gravacoes * FAIXA_COMPLETO * ritmo;
 }
 
 function percentual(uso, now = Date.now()) {
@@ -105,5 +119,5 @@ function medirFirestore(firestoreNs) {
   return { contador, desligar() { while (instalados.length) instalados.pop()(); } };
 }
 
-module.exports = { COTA_GRATIS, LIMITE, FAIXA_COMPLETO, CUSTO_COMPLETO_PADRAO, diaDaCota, proximaVirada, usoDeHoje,
+module.exports = { COTA_GRATIS, LIMITE, FAIXA_COMPLETO, CUSTO_COMPLETO_PADRAO, diaDaCota, proximaVirada, fracaoDoDia, usoDeHoje,
   maiorUso, somarUso, esgotado, cabeCicloCompleto, percentual, resumoDoUso, medirFirestore };

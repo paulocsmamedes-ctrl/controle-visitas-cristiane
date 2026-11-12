@@ -5,11 +5,11 @@ process.env.GOOGLE_CALENDAR_OWNER='c1';
 const api=require('../sync.js');
 function clone(v){return structuredClone(v)}
 class MemoryDB {
- constructor(initial={}){this.rows=new Map();this.version=0;this.tail=Promise.resolve();for(const [key,data] of Object.entries(initial))this.put(key,data)}
+ constructor(initial={}){this.consultas=[];this.rows=new Map();this.version=0;this.tail=Promise.resolve();for(const [key,data] of Object.entries(initial))this.put(key,data)}
  put(key,data){this.rows.set(key,{data:clone(data),version:++this.version})}
  ref(key){return {key,id:key.split('/').at(-1),get:async()=>this.snapshot(key),update:async patch=>{if(!this.rows.has(key))throw Error('missing');this.put(key,{...this.rows.get(key).data,...patch})},delete:async()=>this.rows.delete(key)}}
  snapshot(key){const row=this.rows.get(key);return {id:key.split('/').at(-1),ref:this.ref(key),exists:!!row,data:()=>row?clone(row.data):undefined,updateTime:row?{version:row.version,isEqual(other){return this.version===other?.version}}:undefined}}
- collection(name){const get=async filter=>{const docs=[...this.rows.keys()].filter(k=>k.startsWith(name+'/')).map(k=>this.snapshot(k)).filter(d=>!filter||filter(d.data()));return {docs,size:docs.length}};return {doc:id=>this.ref(name+'/'+id),get:()=>get(),where:(field,op,value)=>({get:()=>get(d=>d[field]===value)})}}
+ collection(name){const get=async filter=>{const docs=[...this.rows.keys()].filter(k=>k.startsWith(name+'/')).map(k=>this.snapshot(k)).filter(d=>!filter||filter(d.data()));return {docs,size:docs.length}};return {doc:id=>this.ref(name+'/'+id),get:()=>get(),where:(field,op,value)=>{const filtros=[];const q={where:(f,o,v)=>{filtros.push([f,o,v]);return q},get:()=>{this.consultas.push(name+':'+filtros.map(x=>x.join('')).join('&'));return get(d=>filtros.every(([f,o,v])=>o==='>='?d[f]>=v:d[f]===v))}};return q.where(field,op,value)}}}
  async runTransaction(fn){let release;const prev=this.tail;this.tail=new Promise(r=>release=r);await prev;try{const operations=[];const tx={get:async ref=>this.snapshot(ref.key),update:(ref,patch)=>operations.push(()=>{assert(this.rows.has(ref.key));this.put(ref.key,{...this.rows.get(ref.key).data,...patch})}),create:(ref,data)=>operations.push(()=>{assert(!this.rows.has(ref.key));this.put(ref.key,data)}),delete:ref=>operations.push(()=>this.rows.delete(ref.key))};const result=await fn(tx);operations.forEach(op=>op());return result}finally{release()}}
 }
 const event=(calendarId='c1',id='e1')=>({id,calendarId,titulo:'Visita antiga',data:'2026-11-15',local:'Centro',descricao:'',raw:{start:{date:'2026-11-15'},end:{date:'2026-11-16'}}});
@@ -141,4 +141,20 @@ test('edição posterior à exclusão permanece local e limpa fila sem perder a 
 test('ciclo sem mudança não abre transações para cada visita já importada',async()=>{
  const db=new MemoryDB();await api.importGoogleEventsIntoVisits(db,[event()]);let calls=0;const previous=db.runTransaction.bind(db);db.runTransaction=fn=>{calls++;return previous(fn)};
  const result=await api.importGoogleEventsIntoVisits(db,[event()]);assert.equal(calls,0);assert.equal(result.updated,0);
+});
+
+test('ciclo de fila lê só pedidos de exclusão recentes e conta os restantes sem reler',async()=>{
+ const db=new MemoryDB({'googleDeletions/velho':{sourceId:'e0',calendarId:'c1',requestedAt:1000,completedAt:'x'},'googleDeletions/novo':{sourceId:'e1',calendarId:'c1',requestedAt:5000},'googleDeletions/falho':{sourceId:'e2',calendarId:'c1',requestedAt:6000}});
+ mockFetch(async url=>url.includes('/e2')?response({},500):new Response(null,{status:204}));
+ const r=await api.processDeletions(db,'token',{desde:4000});
+ assert.equal(r.excluidos,1);assert.equal(r.restantes,1);assert.equal(r.pendentesIds.size,2);
+ assert.ok(db.snapshot('googleDeletions/novo').data().completedAt);assert.equal(db.snapshot('googleDeletions/velho').data().completedAt,'x');
+ assert.deepEqual(db.consultas,['googleDeletions:requestedAt>=4000']);
+});
+test('conclusão por horário consulta só as agendadas de hoje',async()=>{
+ const now=Date.parse('2026-11-12T15:00:00Z');
+ const db=new MemoryDB({'visits/hoje':{status:'Agendada',sourceId:'e1',data:'2026-11-12',googleStartDate:'2026-11-12',googleStartAt:'2026-11-12T10:00:00-03:00'},'visits/amanha':{status:'Agendada',sourceId:'e2',data:'2026-11-13',googleStartDate:'2026-11-13',googleStartAt:'2026-11-13T10:00:00-03:00'}});
+ assert.equal(await api.concluirVisitasPorHorario(db,now),1);
+ assert.equal(db.snapshot('visits/hoje').data().status,'Realizada');assert.equal(db.snapshot('visits/amanha').data().status,'Agendada');
+ assert.deepEqual(db.consultas,['visits:status==Agendada&data==2026-11-12']);
 });

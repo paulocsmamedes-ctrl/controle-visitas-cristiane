@@ -470,12 +470,20 @@ function eventUrl(calendarId, eventId) {
     (eventId ? '/' + encodeURIComponent(eventId) : '');
 }
 
-async function processDeletions(db, accessToken) {
-  const snap = await db.collection('googleDeletions').get();
+// Margem para relógio errado do aparelho que gravou `requestedAt`.
+const MARGEM_PEDIDO_EXCLUSAO_MS = 24 * 60 * 60 * 1000;
+
+// `desde` (ms) limita a leitura aos pedidos recentes: o ciclo de 5 min não relê
+// todo o histórico de exclusões, que só cresce. Pedidos mais antigos, ou sem
+// `requestedAt`, são tratados no ciclo completo, que lê a coleção inteira.
+async function processDeletions(db, accessToken, { desde = null } = {}) {
+  const colecao = db.collection('googleDeletions');
+  const snap = Number.isFinite(desde) ? await colecao.where('requestedAt', '>=', desde).get() : await colecao.get();
   const excluidosIds = new Set();
   // Mesmo pedidos que falhem neste ciclo impedem reimportação.
   const pendentesIds = new Set(snap.docs.map(d => eventKey(d.data().calendarId || 'primary', d.data().sourceId)));
   let excluidos = 0, falhas = 0, scopeError = null;
+  let restantes = snap.docs.filter(d => !d.data().completedAt).length;
   for (const snapshot of snap.docs) {
     const t = snapshot.data();
     if (!t.sourceId || !t.calendarId) { falhas++; continue; }
@@ -494,14 +502,14 @@ async function processDeletions(db, accessToken) {
           if (visit?.exists) tx.update(visitRef, {googleCalendarState:'deleted',googleDeletedAt:admin.firestore.FieldValue.serverTimestamp(),googleDeletionRequested:false,pendingGoogleSync:false,googleSyncError:null});
         }
       });
-      excluidos++;
+      excluidos++; restantes--;
     } catch (e) {
       if (Number(e.code) === 8) throw e;
       falhas++;
       if (e instanceof ScopeError) { scopeError = e.message; break; }
     }
   }
-  return { excluidos, falhas, excluidosIds, pendentesIds, scopeError };
+  return { excluidos, falhas, excluidosIds, pendentesIds, scopeError, restantes };
 }
 
 // Somente o servidor importa. Não se apaga histórico por ausência, renomeação,
@@ -579,7 +587,9 @@ function visitaAtingiuHorario(v, now = Date.now()) {
 }
 
 async function concluirVisitasPorHorario(db, now = Date.now()) {
-  const snap = await db.collection('visits').where('status','==','Agendada').get();
+  // Só visitas de hoje podem atingir o horário: não reler todas as agendadas a cada 5 min.
+  const hoje = new Intl.DateTimeFormat('en-CA', {timeZone:'America/Sao_Paulo',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(now));
+  const snap = await db.collection('visits').where('status','==','Agendada').where('data','==',hoje).get();
   let count = 0;
   for (const snapshot of snap.docs) {
     if (!visitaAtingiuHorario(snapshot.data(), now)) continue;
@@ -594,7 +604,7 @@ async function concluirVisitasPorHorario(db, now = Date.now()) {
   return count;
 }
 
-async function main({ fullSync = true, usoAnterior = null, custoCompleto = null } = {}) {
+async function main({ fullSync = true, usoAnterior = null, custoCompleto = null, ultimoCompleto = null } = {}) {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   const db = admin.firestore();
@@ -618,7 +628,9 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null 
     let del = { excluidos: 0, falhas: 0, excluidosIds: new Set(), pendentesIds: new Set(), scopeError: null };
     let push = { enviados: 0, criados: 0, falhas: 0, adiados: 0, descartados: 0, protegidos: new Set(), scopeError: null };
     // Se a leitura da fila de exclusões falhar, o ciclo para: importar sem ela recriaria exclusões.
-    del = await processDeletions(db, accessToken);
+    // Fora do ciclo completo, só os pedidos feitos desde o último completo (com margem).
+    const desde = fullSync ? null : (Number.isFinite(ultimoCompleto) ? ultimoCompleto : Date.now()) - MARGEM_PEDIDO_EXCLUSAO_MS;
+    del = await processDeletions(db, accessToken, { desde });
     del.excluidosIds.forEach(key => eventById.delete(key));
     // O histórico completo é relido uma vez por hora; a fila continua em cada disparo.
     const visitsSnapshot = fullSync ? await db.collection('visits').get() : null;
@@ -628,8 +640,8 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null 
     result.fullSync = fullSync;
     result.realizadasPorHorario = await concluirVisitasPorHorario(db);
     const pending = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
-    const deletionQueue = await db.collection('googleDeletions').get();
-    const remainingDeletions = deletionQueue.docs.filter(d => !d.data().completedAt).length;
+    // Contado na própria leitura da fila: reler a coleção inteira dobrava o custo.
+    const remainingDeletions = del.restantes;
     const writeScopeError = push.scopeError || del.scopeError || null;
     Object.assign(result, { calendars: calendarsCount, enviados: push.enviados, criadosNoGoogle: push.criados,
       excluidosNoGoogle: del.excluidos, falhasDeEnvio: push.falhas + del.falhas, adiados: push.adiados,
