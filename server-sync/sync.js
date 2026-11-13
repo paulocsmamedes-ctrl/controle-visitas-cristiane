@@ -132,6 +132,50 @@ function shiftDateTimeString(value, days) {
   return addDaysISO(datePart, days) + value.slice(10);
 }
 
+/* HORÁRIO DA VISITA — 13/11/2026.
+   O campo `hora` da visita ('HH:mm', horário de Brasília) é o que o formulário do
+   CRM grava. `googleHora` é o último horário trocado com o Google, na mesma lógica
+   de googleData/googleTitulo/googleLocal: só vai para a agenda o que mudou no CRM.
+   Brasília não tem horário de verão desde 2019, por isso o -03:00 fixo. */
+const HORA_RE = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
+const DURACAO_PADRAO_MS = 60 * 60 * 1000;   // compromisso criado pelo CRM dura 1 h
+const FUSO = 'America/Sao_Paulo';
+
+function horaValida(h) { return HORA_RE.test(String(h || '')) ? String(h) : ''; }
+
+/** 'HH:mm' de Brasília do início do evento; '' para evento de dia inteiro. */
+function horaDoEvento(raw) {
+  const inicio = new Date((raw && raw.start && raw.start.dateTime) || '');
+  if (!Number.isFinite(inicio.getTime())) return '';
+  return new Intl.DateTimeFormat('en-GB', { timeZone: FUSO, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(inicio);
+}
+
+/** Data (AAAA-MM-DD, Brasília) do início do evento. */
+function dataDoEvento(raw) {
+  const start = (raw && raw.start) || {};
+  if (start.dateTime) return new Intl.DateTimeFormat('en-CA', { timeZone: FUSO, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(start.dateTime));
+  return String(start.date || '').slice(0, 10);
+}
+
+function isoBrasilia(ms) { return new Date(ms - 3 * 60 * 60 * 1000).toISOString().slice(0, 19) + '-03:00'; }
+
+/** start/end com horário. Preserva a duração do evento original; sem ela, 1 hora.
+    `limparDiaInteiro` zera o campo `date`: sem isso o PATCH de um evento de dia
+    inteiro para um com horário é recusado pelo Google. */
+function horarioParaGoogle(evOriginal, dataISO, hora, limparDiaInteiro) {
+  const inicio = dataISO + 'T' + hora + ':00-03:00';
+  const s = (evOriginal && evOriginal.start) || {}, e = (evOriginal && evOriginal.end) || {};
+  let duracao = DURACAO_PADRAO_MS;
+  if (s.dateTime && e.dateTime) {
+    const d = Date.parse(e.dateTime) - Date.parse(s.dateTime);
+    if (d > 0) duracao = d;
+  }
+  const extra = limparDiaInteiro ? { date: null } : {};
+  return { inicio,
+    start: { dateTime: inicio, timeZone: FUSO, ...extra },
+    end: { dateTime: isoBrasilia(Date.parse(inicio) + duracao), timeZone: FUSO, ...extra } };
+}
+
 // ---------------------------------------------------------------- autenticação
 
 class ScopeError extends Error {}
@@ -459,21 +503,35 @@ async function pushPendingVisits(db, accessToken, eventById, { parar = () => fal
         if (mudou('googleTitulo', v.imovel)) body.summary = tituloParaGoogle(v.imovel, v.foraDoFunil);
         const local = localDaVisita(v);
         if (local && mudou('googleLocal', v.bairro)) body.location = local;
-        const dates = v.data && mudou('googleData', v.data) ? datasParaGoogle(existing.raw, v.data) : null;
+        const mudouData = !!v.data && mudou('googleData', v.data);
+        // Horário: referência gravada ou, em registro antigo, o próprio evento.
+        // Campo vazio no CRM nunca apaga o horário que está na agenda.
+        const horaCrm = horaValida(v.hora);
+        const horaRef = v.googleHora !== undefined ? (v.googleHora || '') : horaDoEvento(existing.raw);
+        const diaDoHorario = mudouData ? v.data : (dataDoEvento(existing.raw) || v.data);
+        const comHorario = horaCrm && horaCrm !== horaRef && diaDoHorario ? horarioParaGoogle(existing.raw, diaDoHorario, horaCrm, true) : null;
+        const dates = comHorario ? { start: comHorario.start, end: comHorario.end }
+          : mudouData ? datasParaGoogle(existing.raw, v.data) : null;
         if (dates) Object.assign(body, dates);
         await calendarFetch(accessToken, eventUrl(calendarId, v.sourceId), { method: 'PATCH', body: JSON.stringify(body) });
         protegidos.add(eventKey(calendarId, v.sourceId));
         const enviado = { calendarId };
         if (body.summary) enviado.googleTitulo = v.imovel || '';
         if (body.location) enviado.googleLocal = v.bairro || '';
-        if (dates) enviado.googleData = v.data;
+        if (dates && mudouData) enviado.googleData = v.data;
+        if (comHorario) Object.assign(enviado, { googleHora: horaCrm, googleStartAt: comHorario.inicio, googleStartDate: diaDoHorario });
         if (!await acknowledgePush(db, snapshot, enviado)) adiados++;
         enviados++;
       } else {
         if (!v.data) throw new Error('Visita sem data. Corrija a data para enviar; alteração preservada.');
         const id = createdEventId(v.id);
+        // Com horário no formulário, o compromisso nasce com hora marcada (1 h);
+        // sem horário, continua nascendo como dia inteiro.
+        const horaCrm = horaValida(v.hora);
+        const comHorario = horaCrm ? horarioParaGoogle(null, v.data, horaCrm, false) : null;
         const body = { id, summary: tituloParaGoogle(v.imovel, v.foraDoFunil), location: localDaVisita(v),
-          description: buildDescription(v, ''), start: { date: v.data }, end: { date: addDaysISO(v.data, 1) },
+          description: buildDescription(v, ''),
+          start: comHorario ? comHorario.start : { date: v.data }, end: comHorario ? comHorario.end : { date: addDaysISO(v.data, 1) },
           extendedProperties: { private: { crmVisitId: v.id } } };
         try {
           await calendarFetch(accessToken, eventUrl(calendarId), { method: 'POST', body: JSON.stringify(body) });
@@ -485,11 +543,14 @@ async function pushPendingVisits(db, accessToken, eventById, { parar = () => fal
           }
           // Uma tentativa anterior criou o evento, mas não confirmou no Firestore.
           const { id: ignoredId, ...patch } = body;
+          // A tentativa anterior pode ter criado o evento como dia inteiro.
+          if (comHorario) Object.assign(patch, (({ start, end }) => ({ start, end }))(horarioParaGoogle(null, v.data, horaCrm, true)));
           await calendarFetch(accessToken, eventUrl(calendarId, id), { method: 'PATCH', body: JSON.stringify(patch) });
         }
         protegidos.add(eventKey(calendarId, id));
         if (!await acknowledgePush(db, snapshot, { sourceId: id, calendarId, pushedToGoogle: true, imovel: body.summary,
-          googleTitulo: body.summary, googleData: v.data, googleLocal: v.bairro || '' })) adiados++;
+          googleTitulo: body.summary, googleData: v.data, googleLocal: v.bairro || '', googleHora: horaCrm,
+          ...(comHorario ? { googleStartAt: comHorario.inicio, googleStartDate: v.data } : {}) })) adiados++;
         criados++;
       }
     } catch (e) {
@@ -584,6 +645,10 @@ function patchDaAgenda(v, ev, today, now = Date.now()) {
   const startAt = ev.raw?.start?.dateTime || null;
   if ((v.googleStartAt || null) !== startAt) patch.googleStartAt = startAt;
   if ((v.googleStartDate || null) !== (startAt ? ev.data : null)) patch.googleStartDate = startAt ? ev.data : null;
+  // O Google é a fonte do horário: evento de dia inteiro deixa a visita sem hora.
+  const horaEv = horaDoEvento(ev.raw);
+  if (v.googleHora !== horaEv) patch.googleHora = horaEv;
+  if ((v.hora || '') !== horaEv) patch.hora = horaEv;
   if (ev.data !== v.data) patch.data = ev.data;
   if (ev.titulo && ev.titulo !== v.imovel) patch.imovel = ev.titulo;
   if (ev.local && ev.local !== v.bairro) patch.bairro = ev.local;
@@ -644,6 +709,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
         googleStartAt: ev.raw?.start?.dateTime || null, googleStartDate: ev.raw?.start?.dateTime ? ev.data : null,
         data: ev.data, imovel: ev.titulo, bairro: ev.local || '', cliente: '', telefone: '',
         googleData: ev.data, googleTitulo: ev.titulo || '', googleLocal: ev.local || '',
+        hora: horaDoEvento(ev.raw), googleHora: horaDoEvento(ev.raw),
         status: ev.data < today ? 'Realizada' : 'Agendada', followup: '', obs: obsDoGoogle(ev.descricao) || OBS_IMPORT_PADRAO });
       return 'imported';
     });
@@ -771,5 +837,5 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
 if (require.main === module) {
   main().catch(err => { console.error('Sincronização falhou:', err.message); process.exitCode = 1; });
 }
-module.exports = { patchDaAgenda, tituloParaGoogle, settleDeletedVisit, visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
+module.exports = { horaDoEvento, horarioParaGoogle, patchDaAgenda, tituloParaGoogle, settleDeletedVisit, visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
   importedVisitId, createdEventId, reconcileGoogleDeletions, acknowledgePush, pushPendingVisits, processDeletions, importGoogleEventsIntoVisits };

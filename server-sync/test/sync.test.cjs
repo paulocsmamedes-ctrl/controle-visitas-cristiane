@@ -232,3 +232,48 @@ test('pedido concluído sem calendarId não conta como falha',async()=>{
  const db=new MemoryDB({'googleDeletions/x':{sourceId:'e1',completedAt:'ok'}});mockFetch(async()=>{throw Error('não deveria chamar')});
  const r=await api.processDeletions(db,'token');assert.equal(r.falhas,0);
 });
+test('visita criada no CRM com horário nasce no Google com hora marcada e 1 h de duração',async()=>{
+ const db=new MemoryDB({'visits/v1':{imovel:'Casa Jaó',data:'2026-11-20',hora:'15:30',pendingGoogleSync:true}});let posted;
+ mockFetch(async(url,o)=>{if(o?.method==='POST')posted=JSON.parse(o.body);return response({})});
+ const r=await api.pushPendingVisits(db,'token',new Map());assert.equal(r.criados,1);
+ assert.deepEqual(posted.start,{dateTime:'2026-11-20T15:30:00-03:00',timeZone:'America/Sao_Paulo'});
+ assert.equal(posted.end.dateTime,'2026-11-20T16:30:00-03:00');
+ const v=db.snapshot('visits/v1').data();assert.equal(v.googleHora,'15:30');assert.equal(v.googleStartAt,'2026-11-20T15:30:00-03:00');assert.equal(v.googleStartDate,'2026-11-20');assert.equal(v.pendingGoogleSync,false);
+});
+test('visita criada no CRM sem horário continua nascendo como dia inteiro',async()=>{
+ const db=new MemoryDB({'visits/v1':{imovel:'Casa',data:'2026-11-20',hora:'',pendingGoogleSync:true}});let posted;
+ mockFetch(async(url,o)=>{if(o?.method==='POST')posted=JSON.parse(o.body);return response({})});
+ await api.pushPendingVisits(db,'token',new Map());assert.deepEqual(posted.start,{date:'2026-11-20'});assert.equal(db.snapshot('visits/v1').data().googleStartAt,undefined);
+});
+test('horário alterado no CRM vai ao Google preservando a duração; dia inteiro vira horário',async()=>{
+ const envia=async(visita,raw)=>{const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita Casa',googleTitulo:'Visita Casa',googleLocal:'',pendingGoogleSync:true,...visita}});
+  let enviado=null;mockFetch(async(url,o)=>{if(o?.method==='PATCH')enviado=JSON.parse(o.body);return response({})});
+  await api.pushPendingVisits(db,'token',new Map([[api.eventKey('c1','e1'),{id:'e1',calendarId:'c1',raw}]]));return {enviado,v:db.snapshot('visits/v1').data()}};
+ // Evento de 2 h: muda só a hora, a duração é mantida.
+ let x=await envia({data:'2026-11-20',googleData:'2026-11-20',hora:'09:00',googleHora:'14:00'},{id:'e1',start:{dateTime:'2026-11-20T14:00:00-03:00'},end:{dateTime:'2026-11-20T16:00:00-03:00'}});
+ assert.equal(x.enviado.start.dateTime,'2026-11-20T09:00:00-03:00');assert.equal(x.enviado.end.dateTime,'2026-11-20T11:00:00-03:00');assert.equal(x.v.googleHora,'09:00');assert.equal(x.v.googleStartAt,'2026-11-20T09:00:00-03:00');
+ // Dia inteiro ganha horário: precisa zerar `date`.
+ x=await envia({data:'2026-11-20',googleData:'2026-11-20',hora:'10:15',googleHora:''},{id:'e1',start:{date:'2026-11-20'},end:{date:'2026-11-21'}});
+ assert.equal(x.enviado.start.dateTime,'2026-11-20T10:15:00-03:00');assert.equal(x.enviado.start.date,null);assert.equal(x.enviado.end.dateTime,'2026-11-20T11:15:00-03:00');
+ // Data e hora mudam juntas.
+ x=await envia({data:'2026-11-22',googleData:'2026-11-20',hora:'08:00',googleHora:'14:00'},{id:'e1',start:{dateTime:'2026-11-20T14:00:00-03:00'},end:{dateTime:'2026-11-20T15:00:00-03:00'}});
+ assert.equal(x.enviado.start.dateTime,'2026-11-22T08:00:00-03:00');assert.equal(x.v.googleData,'2026-11-22');assert.equal(x.v.googleStartDate,'2026-11-22');
+});
+test('horário igual ao da agenda ou vazio no CRM não mexe no horário do Google',async()=>{
+ const raw={id:'e1',start:{dateTime:'2026-11-20T17:00:00Z'},end:{dateTime:'2026-11-20T18:00:00Z'}};
+ for(const visita of [{hora:'14:00',googleHora:'14:00'},{hora:'14:00'},{hora:'',googleHora:'14:00'},{},{hora:'13:00',googleHora:'13:00'}]){
+  const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita Casa',data:'2026-11-20',googleTitulo:'Visita Casa',googleData:'2026-11-20',googleLocal:'',pendingGoogleSync:true,...visita}});
+  let enviado=null;mockFetch(async(url,o)=>{if(o?.method==='PATCH')enviado=JSON.parse(o.body);return response({})});
+  await api.pushPendingVisits(db,'token',new Map([[api.eventKey('c1','e1'),{id:'e1',calendarId:'c1',raw}]]));
+  assert.equal(enviado.start,undefined,JSON.stringify(visita));
+ }
+});
+test('importação traz o horário do Google para o campo do formulário',async()=>{
+ const ev={id:'e9',calendarId:'c1',titulo:'Visita Apto',data:'2026-11-20',local:'',descricao:'',raw:{start:{dateTime:'2026-11-20T14:30:00-03:00'},end:{dateTime:'2026-11-20T15:30:00-03:00'}}};
+ const db=new MemoryDB();await api.importGoogleEventsIntoVisits(db,[ev]);
+ const key='visits/'+api.importedVisitId('c1','e9');let v=db.snapshot(key).data();assert.equal(v.hora,'14:30');assert.equal(v.googleHora,'14:30');
+ // Reagendado no Google para outro horário: o campo acompanha.
+ ev.raw.start.dateTime='2026-11-20T09:00:00-03:00';await api.importGoogleEventsIntoVisits(db,[ev]);
+ v=db.snapshot(key).data();assert.equal(v.hora,'09:00');assert.equal(v.googleHora,'09:00');
+ assert.equal(api.horaDoEvento({start:{date:'2026-11-20'}}),'');
+});
