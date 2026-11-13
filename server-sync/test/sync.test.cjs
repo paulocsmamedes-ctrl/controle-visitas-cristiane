@@ -158,3 +158,77 @@ test('conclusão por horário consulta só as agendadas de hoje',async()=>{
  assert.equal(db.snapshot('visits/hoje').data().status,'Realizada');assert.equal(db.snapshot('visits/amanha').data().status,'Agendada');
  assert.deepEqual(db.consultas,['visits:status==Agendada&data==2026-11-12']);
 });
+test('pedido de exclusão com visita que não é dona do evento é recusado sem DELETE e não bloqueia reimportação',async()=>{
+ const db=new MemoryDB({'visits/v1':{sourceId:'outro',calendarId:'c1',imovel:'A'},'googleDeletions/q':{sourceId:'e1',calendarId:'c1',requestedAt:1,visitId:'v1'}});
+ let calls=0;mockFetch(async()=>{calls++;return new Response(null,{status:204})});
+ const r=await api.processDeletions(db,'token');
+ assert.equal(calls,0);assert.equal(r.recusados,1);assert.equal(r.excluidos,0);assert.equal(r.restantes,0);
+ const q=db.snapshot('googleDeletions/q').data();assert.ok(q.completedAt);assert.ok(q.recusadoEm);
+ const r2=await api.processDeletions(db,'token');assert.equal(r2.pendentesIds.size,0);
+});
+test('pedido de exclusão confere: evento importado da visita e evento criado pelo CRM são apagados',async()=>{
+ const criado=api.createdEventId('v2');
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1'},'visits/v2':{pendingGoogleSync:false},
+  'googleDeletions/a':{sourceId:'e1',calendarId:'c1',requestedAt:1,visitId:'v1'},'googleDeletions/b':{sourceId:criado,calendarId:'primary',requestedAt:1,visitId:'v2'},
+  'googleDeletions/c':{sourceId:'e9',calendarId:'c1',requestedAt:1}});
+ const urls=[];mockFetch(async url=>{urls.push(url);return new Response(null,{status:204})});
+ const r=await api.processDeletions(db,'token');
+ assert.equal(r.excluidos,3);assert.equal(r.recusados,0);assert.equal(urls.length,3);
+ assert.equal(db.snapshot('visits/v1').data().googleCalendarState,'deleted');
+});
+test('orçamento esgotado no meio da fila para sem apagar o resto e mantém os pedidos pendentes',async()=>{
+ const db=new MemoryDB({'googleDeletions/a':{sourceId:'e1',calendarId:'c1',requestedAt:1},'googleDeletions/b':{sourceId:'e2',calendarId:'c1',requestedAt:2}});
+ let calls=0;mockFetch(async()=>{calls++;return new Response(null,{status:204})});
+ let n=0;const r=await api.processDeletions(db,'token',{parar:()=>n++>=1});
+ assert.equal(r.interrompido,true);assert.equal(calls,1);assert.equal(r.excluidos,1);assert.equal(r.restantes,1);
+ assert.equal(r.pendentesIds.size,2);
+});
+test('orçamento esgotado no envio protege as pendências da importação',async()=>{
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',pendingGoogleSync:true,imovel:'Editado'}});
+ let calls=0;mockFetch(async()=>{calls++;return response({})});
+ const r=await api.pushPendingVisits(db,'token',new Map(),{parar:()=>true});
+ assert.equal(r.interrompido,true);assert.equal(calls,0);assert.ok(r.protegidos.has(api.eventKey('c1','e1')));
+ assert.equal(db.snapshot('visits/v1').data().pendingGoogleSync,true);
+});
+test('excluir no Google o compromisso de venda mantém o status e só etiqueta',async()=>{
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',status:'Vendido',cliente:'C'},'visits/v2':{sourceId:'e2',calendarId:'c1',status:'Realizada'}});
+ mockFetch(async()=>response({status:'cancelled'}));
+ await api.reconcileGoogleDeletions(db,'token',new Map());
+ const v1=db.snapshot('visits/v1').data(),v2=db.snapshot('visits/v2').data();
+ assert.equal(v1.status,'Vendido');assert.equal(v1.exclusaoPreservouStatus,true);assert.equal(v1.googleCalendarState,'deleted');assert.equal(v1.finalizadaPorExclusao,undefined);
+ assert.equal(v2.status,'Atendimento finalizado');
+ // Ciclo seguinte: já regularizada e fora da lista, não consulta o Google.
+ let calls=0;mockFetch(async()=>{calls++;return response({status:'cancelled'})});
+ await api.reconcileGoogleDeletions(db,'token',new Map());assert.equal(calls,0);
+});
+test('envio manda só o que mudou no CRM e não desfaz reagendamento feito no Google',async()=>{
+ const raw={id:'e1',start:{date:'2026-11-20'},end:{date:'2026-11-21'},description:''};
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita Casa',data:'2026-11-15',bairro:'Centro',status:'Proposta enviada',
+  googleTitulo:'Visita Casa',googleData:'2026-11-15',googleLocal:'Centro',pendingGoogleSync:true}});
+ let enviado=null;mockFetch(async(url,o)=>{if(o?.method==='PATCH')enviado=JSON.parse(o.body);return response({})});
+ await api.pushPendingVisits(db,'token',new Map([[api.eventKey('c1','e1'),{id:'e1',calendarId:'c1',raw}]]));
+ assert.ok(enviado.description);assert.equal(enviado.summary,undefined);assert.equal(enviado.start,undefined);assert.equal(enviado.location,undefined);
+ assert.equal(db.snapshot('visits/v1').data().pendingGoogleSync,false);
+});
+test('data alterada no CRM é enviada e vira a nova referência',async()=>{
+ const raw={id:'e1',start:{date:'2026-11-15'},end:{date:'2026-11-16'},description:''};
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita Casa',data:'2026-11-18',status:'Agendada',googleTitulo:'Visita Casa',googleData:'2026-11-15',googleLocal:'',pendingGoogleSync:true}});
+ let enviado=null;mockFetch(async(url,o)=>{if(o?.method==='PATCH')enviado=JSON.parse(o.body);return response({})});
+ await api.pushPendingVisits(db,'token',new Map([[api.eventKey('c1','e1'),{id:'e1',calendarId:'c1',raw}]]));
+ assert.equal(enviado.start.date,'2026-11-18');assert.equal(db.snapshot('visits/v1').data().googleData,'2026-11-18');
+});
+test('visita concluída pelo horário e reagendada para o futuro volta para Agendada',()=>{
+ const now=Date.parse('2026-11-12T14:00:00Z');
+ const v={status:'Realizada',realizadaPorHorario:true,data:'2026-11-12',googleStartAt:'2026-11-12T10:00:00-03:00',googleStartDate:'2026-11-12',imovel:'Visita X'};
+ const ev={data:'2026-11-14',titulo:'Visita X',local:'',descricao:'',calendarId:'c1',raw:{start:{dateTime:'2026-11-14T10:00:00-03:00'}}};
+ const p=api.patchDaAgenda(v,ev,'2026-11-12',now);assert.equal(p.status,'Agendada');assert.equal(p.realizadaPorHorario,false);
+ const manual=api.patchDaAgenda({...v,realizadaPorHorario:false},ev,'2026-11-12',now);assert.equal(manual.status,undefined);
+});
+test('compromisso fora do funil vai ao Google sem o prefixo de visita',()=>{
+ assert.equal(api.tituloParaGoogle('Reunião com advogado',true),'Reunião com advogado');
+ assert.equal(api.tituloParaGoogle('Casa Jaó',false),'Visita - Casa Jaó');
+});
+test('pedido concluído sem calendarId não conta como falha',async()=>{
+ const db=new MemoryDB({'googleDeletions/x':{sourceId:'e1',completedAt:'ok'}});mockFetch(async()=>{throw Error('não deveria chamar')});
+ const r=await api.processDeletions(db,'token');assert.equal(r.falhas,0);
+});

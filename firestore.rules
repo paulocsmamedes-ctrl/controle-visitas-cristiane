@@ -1,17 +1,51 @@
 rules_version = '2';
+
+// ============================================================================
+// Regras do CRM de visitas. ESTE é o arquivo vigente (a pasta 'Site 2 Cristiane'
+// não guarda regras). Publicar só com: firebase deploy --only firestore:rules
+//
+// Quem entra: as duas contas autorizadas, pelo UID (não pelo e-mail: o
+// repositório é público e o UID não é dado pessoal). Trocados em 12/11/2026,
+// lidos do próprio Firebase. Conta nova autorizada = UID novo nesta lista.
+// ============================================================================
+
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    // sign_in_provider == 'password' barra o login anônimo (o projeto ainda tem
+    // contas anônimas da interface antiga); a lista de UIDs barra qualquer conta
+    // criada por fora.
+    function autorizado() {
+      return request.auth != null
+          && request.auth.token.firebase.sign_in_provider == 'password'
+          && request.auth.uid in ['P5FqdvcnrWTOMVcdgqOuIpqMhvW2', '4bRUV3oGq0Oe3uQeXIsMXaq7nHF3'];
+    }
+
     match /visits/{visitId} {
-      allow read, write: if request.auth != null;
+      allow read, write: if autorizado();
     }
+
     match /meta/{docId} {
-      allow read: if request.auth != null;
+      allow read: if autorizado();
+      // Só meta/brand (foto da marca) é gravável pelo navegador. meta/googleSync
+      // é do servidor (Admin SDK, que ignora estas regras).
+      allow write: if autorizado() && docId == 'brand';
     }
-    // Rastros de exclusão: o app grava aqui quando uma visita ligada ao Google Agenda é
-    // excluída, e o sync do servidor apaga o evento correspondente e remove o rastro.
-    // O servidor usa o Admin SDK, que ignora estas regras — elas só liberam o navegador.
+
+    // Pedido de exclusão no Google: o navegador só cria/regrava o pedido, com o
+    // formato exato que o site e o app usam. Quem conclui é o servidor.
+    function pedidoValido() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['sourceId', 'calendarId', 'requestedAt', 'visitId'])
+          && d.sourceId is string && d.sourceId.size() > 0 && d.sourceId.size() < 1100
+          && d.calendarId is string && d.calendarId.size() > 0 && d.calendarId.size() < 300
+          && d.requestedAt is number
+          && (d.visitId == null || (d.visitId is string && exists(/databases/$(database)/documents/visits/$(d.visitId))));
+    }
     match /googleDeletions/{docId} {
-      allow read, write: if request.auth != null;
+      allow read: if autorizado();
+      allow create, update: if autorizado() && pedidoValido();
+      allow delete: if false;
     }
   }
 }

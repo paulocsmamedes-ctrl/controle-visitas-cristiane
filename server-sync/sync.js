@@ -18,7 +18,13 @@ const admin = require('firebase-admin');
 const { createHash } = require('node:crypto');
 const cota = require('./quota.cjs');
 let primaryCalendarId = 'primary';
-const EXPECTED_CALENDAR_OWNER = (process.env.GOOGLE_CALENDAR_OWNER || 'kris.noleto@gmail.com').trim().toLowerCase();
+// Dono esperado da agenda vem só do secret GOOGLE_CALENDAR_OWNER: o repositório é
+// público e não guarda e-mail. Sem ele o ciclo para antes de qualquer escrita.
+const EXPECTED_CALENDAR_OWNER = String(process.env.GOOGLE_CALENDAR_OWNER || '').trim().toLowerCase();
+// Nos registros públicos do Actions o id da agenda (que costuma ser e-mail) sai como hash curto.
+function idParaLog(id) { return 'agenda#' + createHash('sha256').update(String(id)).digest('hex').slice(0, 8); }
+// Etapas com dinheiro combinado ou recebido: excluir o compromisso não rebaixa o funil.
+const STATUS_PRESERVADOS_NA_EXCLUSAO = new Set(['Vendido', 'Contrato assinado', 'Aguardando desfecho bancário', 'Proposta enviada', 'Aguardando assinatura']);
 function calendarKey(id) { return id === 'primary' ? primaryCalendarId : id; }
 function eventKey(calendarId, eventId) { return JSON.stringify([calendarKey(calendarId || 'primary'), eventId]); }
 function importedVisitId(calendarId, id) { return 'gcal_' + createHash('sha256').update(eventKey(calendarId, id)).digest('hex'); }
@@ -185,6 +191,7 @@ async function fetchCalendarIds(accessToken) {
     if (pageToken) seenPages.add(pageToken);
   } while (pageToken);
   const primary = calendars.find(c => c.primary);
+  if (!EXPECTED_CALENDAR_OWNER) throw new ScopeError('Secret GOOGLE_CALENDAR_OWNER ausente: ciclo interrompido antes de qualquer escrita.');
   if (!primary || String(primary.id).toLowerCase() !== EXPECTED_CALENDAR_OWNER) {
     throw new Error('A conta do token Google não corresponde à agenda autorizada. Ciclo interrompido sem alterar visitas.');
   }
@@ -244,7 +251,7 @@ async function fetchGoogleEvents(accessToken) {
   const porCalendario = rawByCalendar.map(c => ({ id: c.id, eventos: c.list.length, truncado: !!c.truncado, erro: c.erro || null }));
   const leituraCompleta = porCalendario.every(c => !c.truncado && !c.erro);
   porCalendario.filter(c => c.truncado || c.erro).forEach(c => {
-    console.error('Leitura incompleta do calendário ' + c.id + ':', c.erro || ('teto de ' + MAX_EVENTS_PER_CALENDAR + ' eventos'));
+    console.error('Leitura incompleta do calendário ' + idParaLog(c.id) + ':', c.erro || ('teto de ' + MAX_EVENTS_PER_CALENDAR + ' eventos'));
   });
 
   const seen = new Set();
@@ -291,7 +298,9 @@ function buildDescription(visit, previousDescription) {
 }
 
 /** Título que sobrevive ao filtro de importação: precisa conter "visita". */
-function tituloParaGoogle(imovel) {
+function tituloParaGoogle(imovel, foraDoFunil = false) {
+  // Compromisso que não é visita (reunião, consulta...) não ganha o prefixo.
+  if (foraDoFunil) return String(imovel || '').trim() || '(sem título)';
   const texto = String(imovel || '').trim() || 'Visita';
   return normalizeText(texto).includes('visita') ? texto : 'Visita - ' + texto;
 }
@@ -346,28 +355,42 @@ async function recordPushError(db, snapshot, message) {
 
 // Somente cancelamento explícito ou HTTP 410 confirma exclusão. Um 404 pode
 // também significar acesso insuficiente: ele aparece como indisponível, sem apagar dados.
+function exclusaoJaRegularizada(v) {
+  return !!(v.finalizadaPorExclusao || v.exclusaoPreservouStatus) && v.googleCalendarState === 'deleted' && !v.pendingGoogleSync && !v.googleSyncError;
+}
 async function settleDeletedVisit(db, snapshot) {
+  // Já regularizada: nem abre transação (era uma leitura por visita excluída a cada ciclo).
+  if (exclusaoJaRegularizada(snapshot.data())) return false;
   return db.runTransaction(async tx => {
     const current = await tx.get(snapshot.ref);
     if (!current.exists || !sameVersion(current, snapshot)) return false;
     const v = current.data();
-    if (v.finalizadaPorExclusao && v.googleCalendarState === 'deleted' && !v.pendingGoogleSync && !v.googleSyncError) return false;
+    if (exclusaoJaRegularizada(v)) return false;
     const patch = {googleCalendarState:'deleted',pendingGoogleSync:false,googleSyncError:null,googleDeletionRequested:false,googleSyncDisposition:'local-only-deleted'};
     if (!v.googleDeletedAt) patch.googleDeletedAt = admin.firestore.FieldValue.serverTimestamp();
-    if (!v.finalizadaPorExclusao) Object.assign(patch, {status:'Atendimento finalizado',statusAntesDaExclusao:v.status || '',statusEm:todayISO(),finalizadaPorExclusao:true});
+    // Decisão de 12/11/2026: venda, contrato, banco, proposta e assinatura mantêm o
+    // status; só ganham a etiqueta de excluída da agenda. O resto é finalizado.
+    if (!v.finalizadaPorExclusao && !v.exclusaoPreservouStatus) {
+      if (STATUS_PRESERVADOS_NA_EXCLUSAO.has(v.status)) patch.exclusaoPreservouStatus = true;
+      else Object.assign(patch, {status:'Atendimento finalizado',statusAntesDaExclusao:v.status || '',statusEm:todayISO(),finalizadaPorExclusao:true});
+    }
     tx.update(snapshot.ref,patch);return true;
   });
 }
 
-async function reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot = null) {
+async function reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot = null, { parar = () => false } = {}) {
   const visits = visitsSnapshot || await db.collection('visits').get();
-  let marked = 0, restored = 0, unavailable = 0, failed = 0;
+  let marked = 0, restored = 0, unavailable = 0, failed = 0, interrompido = false;
   for (const snapshot of visits.docs) {
+    if (parar()) { interrompido = true; break; }
     const v = snapshot.data();
     if (!v.sourceId || !v.calendarId) continue;
     let state = 'active';
     try {
       const listed = eventById.get(eventKey(v.calendarId, v.sourceId));
+      // Exclusão já regularizada e evento ainda fora da lista: continua excluído sem
+      // gastar um GET por ciclo. Se o evento for restaurado, ele volta à lista.
+      if (!listed && exclusaoJaRegularizada(v)) continue;
       const raw = listed?.raw || await calendarFetch(accessToken, eventUrl(v.calendarId, v.sourceId));
       if (raw.status === 'cancelled') state = 'deleted';
     } catch (error) {
@@ -392,15 +415,17 @@ async function reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapsh
     if (changed && state === 'deleted') marked++;
     if (changed && state === 'active') restored++;
   }
-  return { marked, restored, unavailable, failed };
+  return { marked, restored, unavailable, failed, interrompido };
 }
 
-async function pushPendingVisits(db, accessToken, eventById) {
+async function pushPendingVisits(db, accessToken, eventById, { parar = () => false } = {}) {
   const snap = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
   const protegidos = new Set();
-  let enviados = 0, criados = 0, falhas = 0, adiados = 0;
+  let enviados = 0, criados = 0, falhas = 0, adiados = 0, interrompido = false;
   let scopeError = null;
   for (const snapshot of snap.docs) {
+    // Pendência que não foi enviada continua pendente e também protegida da importação.
+    if (parar()) { interrompido = true; snap.docs.forEach(d => { const x = d.data(); if (x.sourceId) protegidos.add(eventKey(x.calendarId || 'primary', x.sourceId)); }); break; }
     const v = { ...snapshot.data(), id: snapshot.id };
     try {
       if (v.googleCalendarState === 'deleted') {
@@ -424,19 +449,30 @@ async function pushPendingVisits(db, accessToken, eventById) {
         existing = { id: v.sourceId, calendarId, raw };
       }
       if (existing) {
-        const body = { summary: tituloParaGoogle(v.imovel), description: buildDescription(v, existing.raw && existing.raw.description) };
+        /* Decisão de 12/11/2026: o CRM envia só o que mudou NELE. googleData,
+           googleTitulo e googleLocal guardam o último valor trocado com o Google;
+           campo igual a ele não foi mexido no CRM e não vai, para não desfazer um
+           reagendamento ou renomeação feitos no Google e ainda não importados.
+           Registro antigo, sem a referência, envia como antes. */
+        const mudou = (campo, atual) => v[campo] === undefined || (atual || '') !== (v[campo] || '');
+        const body = { description: buildDescription(v, existing.raw && existing.raw.description) };
+        if (mudou('googleTitulo', v.imovel)) body.summary = tituloParaGoogle(v.imovel, v.foraDoFunil);
         const local = localDaVisita(v);
-        if (local) body.location = local;
-        const dates = v.data ? datasParaGoogle(existing.raw, v.data) : null;
+        if (local && mudou('googleLocal', v.bairro)) body.location = local;
+        const dates = v.data && mudou('googleData', v.data) ? datasParaGoogle(existing.raw, v.data) : null;
         if (dates) Object.assign(body, dates);
         await calendarFetch(accessToken, eventUrl(calendarId, v.sourceId), { method: 'PATCH', body: JSON.stringify(body) });
         protegidos.add(eventKey(calendarId, v.sourceId));
-        if (!await acknowledgePush(db, snapshot, { calendarId })) adiados++;
+        const enviado = { calendarId };
+        if (body.summary) enviado.googleTitulo = v.imovel || '';
+        if (body.location) enviado.googleLocal = v.bairro || '';
+        if (dates) enviado.googleData = v.data;
+        if (!await acknowledgePush(db, snapshot, enviado)) adiados++;
         enviados++;
       } else {
         if (!v.data) throw new Error('Visita sem data. Corrija a data para enviar; alteração preservada.');
         const id = createdEventId(v.id);
-        const body = { id, summary: tituloParaGoogle(v.imovel), location: localDaVisita(v),
+        const body = { id, summary: tituloParaGoogle(v.imovel, v.foraDoFunil), location: localDaVisita(v),
           description: buildDescription(v, ''), start: { date: v.data }, end: { date: addDaysISO(v.data, 1) },
           extendedProperties: { private: { crmVisitId: v.id } } };
         try {
@@ -452,7 +488,8 @@ async function pushPendingVisits(db, accessToken, eventById) {
           await calendarFetch(accessToken, eventUrl(calendarId, id), { method: 'PATCH', body: JSON.stringify(patch) });
         }
         protegidos.add(eventKey(calendarId, id));
-        if (!await acknowledgePush(db, snapshot, { sourceId: id, calendarId, pushedToGoogle: true, imovel: body.summary })) adiados++;
+        if (!await acknowledgePush(db, snapshot, { sourceId: id, calendarId, pushedToGoogle: true, imovel: body.summary,
+          googleTitulo: body.summary, googleData: v.data, googleLocal: v.bairro || '' })) adiados++;
         criados++;
       }
     } catch (e) {
@@ -462,7 +499,7 @@ async function pushPendingVisits(db, accessToken, eventById) {
       if (e instanceof ScopeError) { scopeError = e.message; break; }
     }
   }
-  return { enviados, criados, falhas, adiados, descartados: 0, protegidos, scopeError };
+  return { enviados, criados, falhas, adiados, descartados: 0, protegidos, scopeError, interrompido };
 }
 
 function eventUrl(calendarId, eventId) {
@@ -476,19 +513,43 @@ const MARGEM_PEDIDO_EXCLUSAO_MS = 24 * 60 * 60 * 1000;
 // `desde` (ms) limita a leitura aos pedidos recentes: o ciclo de 5 min não relê
 // todo o histórico de exclusões, que só cresce. Pedidos mais antigos, ou sem
 // `requestedAt`, são tratados no ciclo completo, que lê a coleção inteira.
-async function processDeletions(db, accessToken, { desde = null } = {}) {
+/* O servidor apaga com credencial própria (o Admin SDK ignora as Firestore Rules).
+   Então, quando o pedido diz de qual visita é, o evento TEM de ser o dessa visita:
+   o que ela importou (sourceId) ou o que o servidor cria para ela (createdEventId).
+   Pedido sem visitId continua valendo: é a lixeira da agenda do site, para evento
+   do Google que nunca virou registro. */
+async function pedidoDeExclusaoConfere(db, t) {
+  if (!t.visitId) return true;
+  const visita = await db.collection('visits').doc(t.visitId).get();
+  if (!visita.exists) return false;
+  const v = visita.data();
+  const eventoDaVisita = v.sourceId === t.sourceId || createdEventId(t.visitId) === t.sourceId;
+  const mesmoCalendario = !v.calendarId || calendarKey(v.calendarId) === calendarKey(t.calendarId || 'primary');
+  return eventoDaVisita && mesmoCalendario;
+}
+
+async function processDeletions(db, accessToken, { desde = null, parar = () => false } = {}) {
   const colecao = db.collection('googleDeletions');
   const snap = Number.isFinite(desde) ? await colecao.where('requestedAt', '>=', desde).get() : await colecao.get();
   const excluidosIds = new Set();
-  // Mesmo pedidos que falhem neste ciclo impedem reimportação.
-  const pendentesIds = new Set(snap.docs.map(d => eventKey(d.data().calendarId || 'primary', d.data().sourceId)));
-  let excluidos = 0, falhas = 0, scopeError = null;
+  // Mesmo pedidos que falhem neste ciclo impedem reimportação. Pedido recusado não.
+  const pendentesIds = new Set(snap.docs.filter(d => !d.data().recusadoEm).map(d => eventKey(d.data().calendarId || 'primary', d.data().sourceId)));
+  let excluidos = 0, falhas = 0, recusados = 0, scopeError = null, interrompido = false;
   let restantes = snap.docs.filter(d => !d.data().completedAt).length;
   for (const snapshot of snap.docs) {
     const t = snapshot.data();
-    if (!t.sourceId || !t.calendarId) { falhas++; continue; }
     if (t.completedAt) continue;
+    if (!t.sourceId || !t.calendarId) { falhas++; continue; }
+    // Orçamento do dia no fim: para aqui; o que sobrou continua na fila.
+    if (parar()) { interrompido = true; break; }
     try {
+      if (!(await pedidoDeExclusaoConfere(db, t))) {
+        // Não apaga nada no Google e tira o pedido da fila, com o motivo gravado.
+        await snapshot.ref.update({ completedAt: admin.firestore.FieldValue.serverTimestamp(), recusadoEm: admin.firestore.FieldValue.serverTimestamp(),
+          motivoDaRecusa: 'O evento do pedido não pertence à visita indicada.' });
+        recusados++; restantes--;
+        continue;
+      }
       try { await calendarFetch(accessToken, eventUrl(t.calendarId, t.sourceId), { method: 'DELETE' }); }
       catch (e) { if (e.status !== 404 && e.status !== 410) throw e; }
       excluidosIds.add(eventKey(t.calendarId, t.sourceId));
@@ -509,13 +570,17 @@ async function processDeletions(db, accessToken, { desde = null } = {}) {
       if (e instanceof ScopeError) { scopeError = e.message; break; }
     }
   }
-  return { excluidos, falhas, excluidosIds, pendentesIds, scopeError, restantes };
+  return { excluidos, falhas, recusados, excluidosIds, pendentesIds, scopeError, restantes, interrompido };
 }
 
 // Somente o servidor importa. Não se apaga histórico por ausência, renomeação,
 // perda de acesso ou janela de datas; exclusões são pedidos explícitos do CRM.
-function patchDaAgenda(v, ev, today) {
+function patchDaAgenda(v, ev, today, now = Date.now()) {
   const patch = {};
+  // Último valor visto no Google: base do "enviar só o que mudou no CRM".
+  if (v.googleData !== ev.data) patch.googleData = ev.data;
+  if (v.googleTitulo !== (ev.titulo || '')) patch.googleTitulo = ev.titulo || '';
+  if (v.googleLocal !== (ev.local || '')) patch.googleLocal = ev.local || '';
   const startAt = ev.raw?.start?.dateTime || null;
   if ((v.googleStartAt || null) !== startAt) patch.googleStartAt = startAt;
   if ((v.googleStartDate || null) !== (startAt ? ev.data : null)) patch.googleStartDate = startAt ? ev.data : null;
@@ -526,11 +591,19 @@ function patchDaAgenda(v, ev, today) {
   const obs = obsDoGoogle(ev.descricao);
   if (obs && obs !== (v.obs || '').trim() && (!(v.obs || '').trim() || v.obs === OBS_IMPORT_PADRAO)) patch.obs = obs;
   if (v.status === 'Agendada' && (patch.data || v.data) < today) patch.status = 'Realizada';
+  // Concluída pelo horário e depois reagendada para o futuro no Google: a visita
+  // não aconteceu. Volta para Agendada (decisão de 12/11/2026).
+  const mudouHorario = 'data' in patch || 'googleStartAt' in patch;
+  const futura = startAt ? Date.parse(startAt) > now : (patch.data || v.data) > today;
+  if (v.realizadaPorHorario && v.status === 'Realizada' && mudouHorario && futura) {
+    Object.assign(patch, { status: 'Agendada', realizadaPorHorario: false, realizadaAutomaticamenteEm: null, statusEm: today });
+  }
   return patch;
 }
 
 async function importGoogleEventsIntoVisits(db, events, opts = {}) {
-  const { protegidos = new Set(), excluidosIds = new Set(), pendentesIds = new Set(), leituraCompleta = true } = opts;
+  const { protegidos = new Set(), excluidosIds = new Set(), pendentesIds = new Set(), leituraCompleta = true, parar = () => false } = opts;
+  let interrompido = false;
   const today = todayISO();
   const visits = opts.visitsSnapshot || await db.collection('visits').get();
   const byKey = new Map();
@@ -545,6 +618,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
   }
   let imported = 0, updated = 0, skipped = 0;
   for (const ev of events) {
+    if (parar()) { interrompido = true; break; }
     const key = eventKey(ev.calendarId, ev.id);
     if (!ev.data || ev.raw?.status === 'cancelled' || !normalizeText(ev.titulo).includes('visita') || protegidos.has(key) || excluidosIds.has(key) || pendentesIds.has(key)) { skipped++; continue; }
     if (legacy.has(ev.id) && counts.get(ev.id) !== 1) { skipped++; continue; }
@@ -569,6 +643,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
       tx.create(ref, { sourceId: ev.id, calendarId: ev.calendarId, fromGoogle: true,
         googleStartAt: ev.raw?.start?.dateTime || null, googleStartDate: ev.raw?.start?.dateTime ? ev.data : null,
         data: ev.data, imovel: ev.titulo, bairro: ev.local || '', cliente: '', telefone: '',
+        googleData: ev.data, googleTitulo: ev.titulo || '', googleLocal: ev.local || '',
         status: ev.data < today ? 'Realizada' : 'Agendada', followup: '', obs: obsDoGoogle(ev.descricao) || OBS_IMPORT_PADRAO });
       return 'imported';
     });
@@ -576,7 +651,7 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
     else if (outcome === 'updated') updated++;
     else skipped++;
   }
-  return { imported, updated, skipped, removed: 0, totalEvents: events.length, leituraCompleta };
+  return { imported, updated, skipped, removed: 0, totalEvents: events.length, leituraCompleta, interrompido };
 }
 
 function visitaAtingiuHorario(v, now = Date.now()) {
@@ -616,6 +691,8 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
     // O contador gravado no banco sobrevive à perda do cache do Actions.
     const anterior = await meta.get();
     usoBase = cota.maiorUso(usoBase, anterior.exists ? anterior.data().cotaDoSync : null);
+    // Sem o cache do Actions, o custo medido do completo vem do banco, não da estimativa.
+    if (!custoCompleto && anterior.exists && anterior.data().custoCompleto) custoCompleto = anterior.data().custoCompleto;
     if (cota.esgotado(usoBase)) {
       console.warn(cota.resumoDoUso(usoAtual()));
       return { healthy: false, fullSync: false, leituraCompleta: false, orcamentoEsgotado: true, uso: usoAtual(), custoCiclo: { ...medidor.contador } };
@@ -623,22 +700,35 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
     if (fullSync && !cota.cabeCicloCompleto(usoBase, custoCompleto)) { fullSync = false; console.warn('Orçamento diário acima de ' + Math.round(cota.FAIXA_COMPLETO * 100) + '%: ciclo só de envio de pendências.'); }
     await meta.set({ lastAttemptAt: admin.firestore.FieldValue.serverTimestamp(), status: 'running' }, { merge: true });
     const accessToken = await getFreshAccessToken();
-    const { events, calendarsCount, leituraCompleta, porCalendario } = await fetchGoogleEvents(accessToken);
+    // Orçamento checado DURANTE o ciclo, não só antes: cada laço para quando o uso
+    // do dia chega ao limite, e o que sobrou fica na fila para depois da virada.
+    const parar = () => cota.esgotado(usoAtual());
+    // A agenda só é lida quando alguém vai usá-la: no ciclo completo (importação e
+    // reconciliação) ou quando há visita pendente de envio (o envio precisa do
+    // evento original). Pedido de exclusão não precisa dela.
+    const precisaDaAgenda = fullSync || !(await db.collection('visits').where('pendingGoogleSync', '==', true).get()).empty;
+    const { events, calendarsCount, leituraCompleta, porCalendario } = precisaDaAgenda
+      ? await fetchGoogleEvents(accessToken)
+      : { events: [], calendarsCount: 0, leituraCompleta: true, porCalendario: null };
     const eventById = new Map(events.map(ev => [eventKey(ev.calendarId, ev.id), ev]));
     let del = { excluidos: 0, falhas: 0, excluidosIds: new Set(), pendentesIds: new Set(), scopeError: null };
     let push = { enviados: 0, criados: 0, falhas: 0, adiados: 0, descartados: 0, protegidos: new Set(), scopeError: null };
     // Se a leitura da fila de exclusões falhar, o ciclo para: importar sem ela recriaria exclusões.
     // Fora do ciclo completo, só os pedidos feitos desde o último completo (com margem).
     const desde = fullSync ? null : (Number.isFinite(ultimoCompleto) ? ultimoCompleto : Date.now()) - MARGEM_PEDIDO_EXCLUSAO_MS;
-    del = await processDeletions(db, accessToken, { desde });
+    del = await processDeletions(db, accessToken, { desde, parar });
     del.excluidosIds.forEach(key => eventById.delete(key));
     // O histórico completo é relido a cada ~15 min; a fila continua em cada disparo.
     const visitsSnapshot = fullSync ? await db.collection('visits').get() : null;
-    const reconciliation = fullSync ? await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot) : { marked:0, restored:0, unavailable:0, failed:0 };
-    push = await pushPendingVisits(db, accessToken, eventById);
-    const result = fullSync ? await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta, visitsSnapshot }) : { imported:0, updated:0, skipped:0, removed:0, totalEvents:events.length, leituraCompleta };
+    const reconciliation = fullSync ? await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot, { parar }) : { marked:0, restored:0, unavailable:0, failed:0 };
+    push = await pushPendingVisits(db, accessToken, eventById, { parar });
+    const result = fullSync ? await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta, visitsSnapshot, parar }) : { imported:0, updated:0, skipped:0, removed:0, totalEvents:events.length, leituraCompleta };
     result.fullSync = fullSync;
-    result.realizadasPorHorario = await concluirVisitasPorHorario(db);
+    result.agendaLida = precisaDaAgenda;
+    result.realizadasPorHorario = parar() ? 0 : await concluirVisitasPorHorario(db);
+    const interrompido = !!(del.interrompido || reconciliation.interrompido || push.interrompido || result.interrompido);
+    result.interrompidoPeloOrcamento = interrompido;
+    result.pedidosRecusados = del.recusados || 0;
     const pending = await db.collection('visits').where('pendingGoogleSync', '==', true).get();
     // Contado na própria leitura da fila: reler a coleção inteira dobrava o custo.
     const remainingDeletions = del.restantes;
@@ -648,20 +738,26 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
       descartados: 0, pendentes: pending.size, exclusoesPendentes: remainingDeletions,
       excluidasNaAgenda: reconciliation.marked, restauradasNaAgenda: reconciliation.restored,
       naoLocalizadasNaAgenda: reconciliation.unavailable, falhasDeVerificacao: reconciliation.failed });
-    const healthy = leituraCompleta && !writeScopeError && !result.falhasDeEnvio && !result.pendentes && !result.exclusoesPendentes && !result.falhasDeVerificacao;
+    const healthy = leituraCompleta && !interrompido && !writeScopeError && !result.falhasDeEnvio && !result.pendentes && !result.exclusoesPendentes && !result.falhasDeVerificacao;
     const metadata = { lastCycleAt: admin.firestore.FieldValue.serverTimestamp(), lastCycle: result,
-      writeScopeError, lastError: null, status: healthy ? 'ok' : 'partial', source: 'github-actions', porCalendario };
-    if (fullSync) { metadata.lastSyncedAt = admin.firestore.FieldValue.serverTimestamp(); metadata.lastImport = result; }
+      writeScopeError, lastError: null, status: healthy ? 'ok' : 'partial', source: 'github-actions' };
+    if (porCalendario) metadata.porCalendario = porCalendario;
+    // lastSyncedAt = "a agenda foi lida inteira e importada". Leitura parcial ou
+    // ciclo cortado pelo orçamento não contam: a tela mostraria dado novo que não é.
+    if (fullSync) metadata.lastImport = result;
+    if (fullSync && leituraCompleta && !interrompido) metadata.lastSyncedAt = admin.firestore.FieldValue.serverTimestamp();
     if (healthy && fullSync) metadata.lastSuccessfulAt = admin.firestore.FieldValue.serverTimestamp();
     // Conta a própria gravação deste registro.
     metadata.cotaDoSync = { ...usoAtual({ gravacoes: 1 }), limiteLeituras: cota.LIMITE.leituras, limiteGravacoes: cota.LIMITE.gravacoes };
     result.custoDoCiclo = { leituras: medidor.contador.leituras, gravacoes: medidor.contador.gravacoes + 1 };
+    if (fullSync && !interrompido) metadata.custoCompleto = { ...result.custoDoCiclo };
     metadata.lastCycle = result;
     await meta.set(metadata, { merge: true });
     console.log('Ciclo finalizado:', JSON.stringify(result));
     console.log(cota.resumoDoUso(usoAtual()));
     if (!healthy) console.warn('Sincronização parcial; consulte meta/googleSync e as pendências no CRM.');
-    return { healthy, fullSync, leituraCompleta, uso: usoAtual(), custoCiclo: { ...medidor.contador } };
+    // Ciclo cortado pelo orçamento: o run-sync pausa até a virada da cota.
+    return { healthy, fullSync, leituraCompleta: leituraCompleta && !interrompido, orcamentoEsgotado: interrompido || undefined, uso: usoAtual(), custoCiclo: { ...medidor.contador } };
   } catch (e) {
     // A cota já bloqueou o banco: não insistir numa segunda escrita de erro.
     if (Number(e.code) !== 8) await meta.set({ status: 'error', lastError: String(e.message).slice(0, 300) }, { merge: true }).catch(() => {});
@@ -675,5 +771,5 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
 if (require.main === module) {
   main().catch(err => { console.error('Sincronização falhou:', err.message); process.exitCode = 1; });
 }
-module.exports = { settleDeletedVisit, visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
+module.exports = { patchDaAgenda, tituloParaGoogle, settleDeletedVisit, visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
   importedVisitId, createdEventId, reconcileGoogleDeletions, acknowledgePush, pushPendingVisits, processDeletions, importGoogleEventsIntoVisits };

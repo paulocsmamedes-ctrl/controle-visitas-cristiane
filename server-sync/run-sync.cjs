@@ -25,14 +25,17 @@ async function runControlled({ sync, file, now = Date.now(), report = () => {} }
     const result = {state:'budget_paused', retryAfter:state.retryAfter, motivo:'orcamento', uso}; report(result); return result;
   }
   const horaDoCompleto = !Number.isFinite(state.lastFullSyncAt) || now - state.lastFullSyncAt >= INTERVALO_COMPLETO_MS;
-  const fullSync = horaDoCompleto && cota.cabeCicloCompleto(uso, state.custoCompleto, now);
+  // Sem custo medido no cache, quem decide é o sync.js, que lê o custo guardado no banco.
+  const fullSync = horaDoCompleto && (!state.custoCompleto || cota.cabeCicloCompleto(uso, state.custoCompleto, now));
   try {
     const outcome = await sync({fullSync, usoAnterior:uso, custoCompleto:state.custoCompleto || null, ultimoCompleto:Number.isFinite(state.lastFullSyncAt) ? state.lastFullSyncAt : null});
     delete state.retryAfter;
     const fezCompleto = outcome?.fullSync ?? fullSync;
     if (outcome?.uso) state.uso = cota.usoDeHoje(outcome.uso, now);
     if (fezCompleto && outcome?.custoCiclo) state.custoCompleto = {leituras:outcome.custoCiclo.leituras, gravacoes:outcome.custoCiclo.gravacoes};
-    if (fezCompleto && outcome?.healthy && outcome?.leituraCompleta) state.lastFullSyncAt = now;
+    // Agenda lida inteira conta como completo, mesmo com envio falhando: uma pendência
+    // presa (ex.: agenda só de leitura) forçava completo a cada 5 min e queimava a cota.
+    if (fezCompleto && outcome?.leituraCompleta) state.lastFullSyncAt = now;
     if (outcome?.orcamentoEsgotado || (state.uso && cota.esgotado(state.uso, now))) {
       Object.assign(state, {retryAfter:cota.proximaVirada(now), motivo:'orcamento'}); save();
       const result = {state:'budget_paused', retryAfter:state.retryAfter, motivo:'orcamento', uso:state.uso}; report(result); return result;

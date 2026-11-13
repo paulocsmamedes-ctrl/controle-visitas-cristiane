@@ -9,3 +9,7 @@ node_modules/
 
 # Controle local de cota e intervalo de sincronização
 server-sync/.sync-control/
+
+# Interface antiga (14/08/2026): fica só no disco, com dados pessoais
+controle-visitas.html
+public/

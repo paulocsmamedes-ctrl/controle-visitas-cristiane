@@ -25,6 +25,11 @@ const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 const { spawnSync, exec } = require('child_process');
+const crypto = require('crypto');
+// Fluxo OAuth com state (contra CSRF) e PKCE (o código sozinho não vale nada).
+const OAUTH_STATE = crypto.randomBytes(24).toString('base64url');
+const PKCE_VERIFIER = crypto.randomBytes(48).toString('base64url');
+const PKCE_CHALLENGE = crypto.createHash('sha256').update(PKCE_VERIFIER).digest('base64url');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const CLIENT_FILE = path.join(__dirname, '.oauth-client.json');
@@ -120,6 +125,12 @@ const server = http.createServer(async (req, res) => {
 
   const code = url.searchParams.get('code');
   const error = url.searchParams.get('error');
+  if (url.searchParams.get('state') !== OAUTH_STATE) {
+    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<h1>Resposta recusada.</h1>O parâmetro state não confere. Rode o script de novo.');
+    console.error('\nResposta de autorização com state inválido: ignorada.');
+    return;
+  }
   if (error) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end('<h1>Autorização negada.</h1>Pode fechar esta aba.');
@@ -139,7 +150,8 @@ const server = http.createServer(async (req, res) => {
         client_id: CLIENT_ID,
         client_secret: CLIENT_SECRET,
         redirect_uri: `http://127.0.0.1:${port}/callback`,
-        grant_type: 'authorization_code'
+        grant_type: 'authorization_code',
+        code_verifier: PKCE_VERIFIER
       })
     });
     const tokenData = await tokenRes.json();
@@ -199,6 +211,9 @@ server.listen(0, '127.0.0.1', () => {
   authUrl.searchParams.set('client_id', CLIENT_ID);
   authUrl.searchParams.set('redirect_uri', `http://127.0.0.1:${port}/callback`);
   authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('state', OAUTH_STATE);
+  authUrl.searchParams.set('code_challenge', PKCE_CHALLENGE);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('scope', SCOPE);
   authUrl.searchParams.set('access_type', 'offline'); // exige refresh_token
   authUrl.searchParams.set('prompt', 'consent');       // força reemitir o refresh_token mesmo se já autorizou antes
@@ -206,7 +221,7 @@ server.listen(0, '127.0.0.1', () => {
   const url = authUrl.toString();
   console.log('\n============================================================');
   console.log(' ATENÇÃO: faça login com a conta DONA DA AGENDA');
-  console.log(' (kris.noleto@gmail.com) — não com outra conta.');
+  console.log(' (a mesma do secret GOOGLE_CALENDAR_OWNER) — não com outra conta.');
   console.log(' O token fica preso na conta que autorizar.');
   console.log('============================================================\n');
   console.log('Abrindo o navegador. Se não abrir, use este endereço:\n');
