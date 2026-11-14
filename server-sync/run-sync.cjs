@@ -61,7 +61,7 @@ function report(result) {
     message = `Sincronização NÃO concluída: Firebase sem cota disponível. Nova tentativa após ${new Date(result.retryAfter).toISOString()}. As pendências permanecem preservadas.`;
     console.warn(`::warning::${message}`);
   } else {
-    message = `Ciclo ${result.fullSync ? 'com histórico completo' : 'de envio de pendências'}: ${result.state}. A importação e verificação de exclusões do Google ocorrem no ciclo completo, a cada ~15 min (o ritmo da cota pode espaçar).`;
+    message = `Ciclo ${result.fullSync ? 'com histórico completo' : 'rápido (pendências e mudanças recentes da Agenda)'}: ${result.state}. Visita nova ou alterada no Google chega em cada disparo (~5 min, leitura rápida). A verificação de eventos apagados no Google ocorre no ciclo completo, a cada ~15 min (o ritmo da cota pode espaçar).`;
     if (result.economia) message += ' Ciclo completo adiado para economizar a cota do dia.';
   }
   if (result.uso) message += ' ' + cota.resumoDoUso(result.uso);

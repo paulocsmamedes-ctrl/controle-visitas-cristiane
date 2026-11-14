@@ -250,7 +250,7 @@ async function fetchCalendarIds(accessToken) {
    cara de calendário lido inteiro, e a fase de leitura apagava do CRM toda
    visita cujo evento tivesse ficado de fora. Agora a falha viaja junto com o
    resultado e quem chama decide o que fazer com ela. */
-async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal) {
+async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal, updatedMin = null) {
   let events = [];
   let pageToken;
   let truncado = false;
@@ -261,6 +261,8 @@ async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal) {
     url.searchParams.set('singleEvents', 'true');
     url.searchParams.set('orderBy', 'startTime');
     url.searchParams.set('maxResults', '250');
+    // Leitura rápida: o Google devolve só o que foi criado ou alterado desde então.
+    if (updatedMin) url.searchParams.set('updatedMin', updatedMin);
     if (pageToken) url.searchParams.set('pageToken', pageToken);
     let data;
     try {
@@ -282,11 +284,11 @@ async function fetchEventsFromCalendar(accessToken, calendarId, prazoFinal) {
 // larga para uma agenda grande sem chegar perto do disparo seguinte (5 min).
 const PRAZO_LEITURA_MS = 3 * 60 * 1000;
 
-async function fetchGoogleEvents(accessToken) {
+async function fetchGoogleEvents(accessToken, { updatedMin = null } = {}) {
   const calendarIds = await fetchCalendarIds(accessToken);
   const prazoFinal = Date.now() + PRAZO_LEITURA_MS;
   const rawByCalendar = await Promise.all(
-    calendarIds.map(id => fetchEventsFromCalendar(accessToken, id, prazoFinal)
+    calendarIds.map(id => fetchEventsFromCalendar(accessToken, id, prazoFinal, updatedMin)
       .then(r => ({ id, list: r.events, truncado: r.truncado, erro: r.erro }))
       .catch(e => ({ id, list: [], truncado: true, erro: String((e && e.message) || e) })))
   );
@@ -720,6 +722,40 @@ async function importGoogleEventsIntoVisits(db, events, opts = {}) {
   return { imported, updated, skipped, removed: 0, totalEvents: events.length, leituraCompleta, interrompido };
 }
 
+/* LEITURA RÁPIDA — roda nos disparos de 5 min, entre um ciclo completo e outro.
+
+   Antes, visita criada ou alterada no Google Agenda só chegava ao CRM no ciclo
+   completo (~15 min). Aqui o servidor pede ao Google apenas os eventos mexidos
+   desde o último completo (`updatedMin`) e importa só esses. Sem mudança na
+   Agenda, o custo no Firestore é ZERO leituras; com mudança, lê apenas as visitas
+   daqueles eventos (consulta por `sourceId`), nunca a coleção inteira.
+
+   O que continua só no ciclo completo: conferir evento APAGADO no Google
+   (reconciliação) e o carimbo `lastSyncedAt`. Evento cancelado vem sem data e é
+   descartado aqui, como na importação normal. */
+const MARGEM_LEITURA_RAPIDA_MS = 2 * 60 * 1000;   // folga de relógio entre o runner e o Google
+const LOTE_IN = 30;                               // teto do operador `in` do Firestore
+
+async function lerMudancasDaAgenda(db, accessToken, desdeMs, opts = {}) {
+  const corte = desdeMs - MARGEM_LEITURA_RAPIDA_MS;
+  let events, leituraCompleta = true;
+  if (opts.eventosDaAgenda) {
+    // A agenda inteira já foi lida neste disparo (havia envio pendente): filtra em memória.
+    events = opts.eventosDaAgenda.filter(ev => Date.parse(ev.raw?.updated || '') >= corte);
+  } else {
+    ({ events, leituraCompleta } = await fetchGoogleEvents(accessToken, { updatedMin: new Date(corte).toISOString() }));
+  }
+  const candidatos = events.filter(ev => ev.data && ev.raw?.status !== 'cancelled' && normalizeText(ev.titulo).includes('visita'));
+  if (!candidatos.length) return { eventos: events.length, imported: 0, updated: 0, leituraCompleta, interrompido: false };
+  const ids = [...new Set(candidatos.map(ev => ev.id))];
+  const docs = [];
+  for (let i = 0; i < ids.length; i += LOTE_IN) {
+    docs.push(...(await db.collection('visits').where('sourceId', 'in', ids.slice(i, i + LOTE_IN)).get()).docs);
+  }
+  const r = await importGoogleEventsIntoVisits(db, candidatos, { ...opts, leituraCompleta, visitsSnapshot: { docs } });
+  return { eventos: events.length, imported: r.imported, updated: r.updated, leituraCompleta, interrompido: !!r.interrompido };
+}
+
 function visitaAtingiuHorario(v, now = Date.now()) {
   if (v.status !== 'Agendada' || !v.sourceId || v.foraDoFunil || v.pendingGoogleSync || ['deleted','unavailable'].includes(v.googleCalendarState)) return false;
   const start = Date.parse(v.googleStartAt || '');
@@ -789,6 +825,21 @@ async function main({ fullSync = true, usoAnterior = null, custoCompleto = null,
     const reconciliation = fullSync ? await reconcileGoogleDeletions(db, accessToken, eventById, visitsSnapshot, { parar }) : { marked:0, restored:0, unavailable:0, failed:0 };
     push = await pushPendingVisits(db, accessToken, eventById, { parar });
     const result = fullSync ? await importGoogleEventsIntoVisits(db, events, { ...del, protegidos: push.protegidos, leituraCompleta, visitsSnapshot, parar }) : { imported:0, updated:0, skipped:0, removed:0, totalEvents:events.length, leituraCompleta };
+    // Disparo de 5 min: importa só o que mudou na Agenda desde o último completo.
+    // Uma falha aqui nunca derruba o envio de pendências; o ciclo completo cobre.
+    if (!fullSync && Number.isFinite(ultimoCompleto) && !parar()) {
+      try {
+        const rapida = await lerMudancasDaAgenda(db, accessToken, ultimoCompleto, { ...del, protegidos: push.protegidos, parar,
+          eventosDaAgenda: precisaDaAgenda && leituraCompleta ? events : null });
+        result.imported = rapida.imported; result.updated = rapida.updated;
+        result.interrompido = rapida.interrompido;
+        result.leituraRapida = { eventos: rapida.eventos, completa: rapida.leituraCompleta };
+      } catch (e) {
+        if (Number(e.code) === 8) throw e;
+        console.warn('Leitura rápida da Agenda falhou (o ciclo completo cobre):', String((e && e.message) || e).slice(0, 200));
+        result.leituraRapida = { erro: String((e && e.message) || e).slice(0, 200) };
+      }
+    }
     result.fullSync = fullSync;
     result.agendaLida = precisaDaAgenda;
     result.realizadasPorHorario = parar() ? 0 : await concluirVisitasPorHorario(db);
@@ -838,4 +889,4 @@ if (require.main === module) {
   main().catch(err => { console.error('Sincronização falhou:', err.message); process.exitCode = 1; });
 }
 module.exports = { horaDoEvento, horarioParaGoogle, patchDaAgenda, tituloParaGoogle, settleDeletedVisit, visitaAtingiuHorario, concluirVisitasPorHorario, main, fetchCalendarIds, fetchGoogleEvents, fetchWithRetry, calendarFetch, eventKey,
-  importedVisitId, createdEventId, reconcileGoogleDeletions, acknowledgePush, pushPendingVisits, processDeletions, importGoogleEventsIntoVisits };
+  importedVisitId, createdEventId, reconcileGoogleDeletions, acknowledgePush, pushPendingVisits, processDeletions, importGoogleEventsIntoVisits, lerMudancasDaAgenda };

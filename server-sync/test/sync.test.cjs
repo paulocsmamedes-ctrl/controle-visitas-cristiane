@@ -9,7 +9,7 @@ class MemoryDB {
  put(key,data){this.rows.set(key,{data:clone(data),version:++this.version})}
  ref(key){return {key,id:key.split('/').at(-1),get:async()=>this.snapshot(key),update:async patch=>{if(!this.rows.has(key))throw Error('missing');this.put(key,{...this.rows.get(key).data,...patch})},delete:async()=>this.rows.delete(key)}}
  snapshot(key){const row=this.rows.get(key);return {id:key.split('/').at(-1),ref:this.ref(key),exists:!!row,data:()=>row?clone(row.data):undefined,updateTime:row?{version:row.version,isEqual(other){return this.version===other?.version}}:undefined}}
- collection(name){const get=async filter=>{const docs=[...this.rows.keys()].filter(k=>k.startsWith(name+'/')).map(k=>this.snapshot(k)).filter(d=>!filter||filter(d.data()));return {docs,size:docs.length}};return {doc:id=>this.ref(name+'/'+id),get:()=>get(),where:(field,op,value)=>{const filtros=[];const q={where:(f,o,v)=>{filtros.push([f,o,v]);return q},get:()=>{this.consultas.push(name+':'+filtros.map(x=>x.join('')).join('&'));return get(d=>filtros.every(([f,o,v])=>o==='>='?d[f]>=v:d[f]===v))}};return q.where(field,op,value)}}}
+ collection(name){const get=async filter=>{const docs=[...this.rows.keys()].filter(k=>k.startsWith(name+'/')).map(k=>this.snapshot(k)).filter(d=>!filter||filter(d.data()));return {docs,size:docs.length}};return {doc:id=>this.ref(name+'/'+id),get:()=>get(),where:(field,op,value)=>{const filtros=[];const q={where:(f,o,v)=>{filtros.push([f,o,v]);return q},get:()=>{this.consultas.push(name+':'+filtros.map(x=>x.join('')).join('&'));return get(d=>filtros.every(([f,o,v])=>o==='>='?d[f]>=v:o==='in'?v.includes(d[f]):d[f]===v))}};return q.where(field,op,value)}}}
  async runTransaction(fn){let release;const prev=this.tail;this.tail=new Promise(r=>release=r);await prev;try{const operations=[];const tx={get:async ref=>this.snapshot(ref.key),update:(ref,patch)=>operations.push(()=>{assert(this.rows.has(ref.key));this.put(ref.key,{...this.rows.get(ref.key).data,...patch})}),create:(ref,data)=>operations.push(()=>{assert(!this.rows.has(ref.key));this.put(ref.key,data)}),delete:ref=>operations.push(()=>this.rows.delete(ref.key))};const result=await fn(tx);operations.forEach(op=>op());return result}finally{release()}}
 }
 const event=(calendarId='c1',id='e1')=>({id,calendarId,titulo:'Visita antiga',data:'2026-11-15',local:'Centro',descricao:'',raw:{start:{date:'2026-11-15'},end:{date:'2026-11-16'}}});
@@ -276,4 +276,48 @@ test('importação traz o horário do Google para o campo do formulário',async(
  ev.raw.start.dateTime='2026-11-20T09:00:00-03:00';await api.importGoogleEventsIntoVisits(db,[ev]);
  v=db.snapshot(key).data();assert.equal(v.hora,'09:00');assert.equal(v.googleHora,'09:00');
  assert.equal(api.horaDoEvento({start:{date:'2026-11-20'}}),'');
+});
+
+/* Leitura rápida: mudanças da Agenda nos disparos de 5 min. */
+const AGORA=Date.parse('2026-11-13T12:00:00Z');
+function agendaFalsa(items,vistos=[]){mockFetch(async url=>{const u=new URL(url);if(u.pathname.endsWith('/calendarList'))return response({items:[{id:'c1',primary:true}]});vistos.push(u.searchParams.get('updatedMin'));return response({items})})}
+function contarLeiturasInteiras(db){const cont={n:0};const orig=db.collection.bind(db);db.collection=name=>{const c=orig(name);const g=c.get;c.get=()=>{cont.n++;return g()};return c};return cont}
+const bruto=(id,extra={})=>({id,summary:'Visita Jardins',location:'Centro',start:{dateTime:'2026-11-20T09:00:00-03:00'},end:{dateTime:'2026-11-20T10:00:00-03:00'},updated:'2026-11-13T12:03:00Z',...extra});
+test('leitura rápida pede ao Google só o que mudou desde o último completo (com margem)',async()=>{
+ const vistos=[];agendaFalsa([],vistos);const db=new MemoryDB();
+ const r=await api.lerMudancasDaAgenda(db,'token',AGORA);
+ assert.deepEqual(vistos,['2026-11-13T11:58:00.000Z']);assert.equal(r.eventos,0);assert.equal(r.imported,0);
+});
+test('leitura rápida sem mudança na Agenda não lê nada no Firestore',async()=>{
+ agendaFalsa([]);const db=new MemoryDB({'visits/v1':{sourceId:'x',calendarId:'c1',imovel:'Visita'}});const cont=contarLeiturasInteiras(db);
+ await api.lerMudancasDaAgenda(db,'token',AGORA);assert.equal(cont.n,0);assert.deepEqual(db.consultas,[]);
+});
+test('leitura rápida importa visita nova sem reler a coleção inteira',async()=>{
+ agendaFalsa([bruto('novo1')]);const db=new MemoryDB({'visits/v1':{sourceId:'outro',calendarId:'c1',imovel:'Visita antiga'}});const cont=contarLeiturasInteiras(db);
+ const r=await api.lerMudancasDaAgenda(db,'token',AGORA);
+ assert.equal(r.imported,1);assert.equal(cont.n,0);assert.equal(db.consultas.length,1);assert.match(db.consultas[0],/^visits:sourceIdin/);
+ const nova=db.snapshot('visits/'+api.importedVisitId('c1','novo1')).data();assert.equal(nova.imovel,'Visita Jardins');assert.equal(nova.data,'2026-11-20');assert.equal(nova.hora,'09:00');assert.equal(nova.status,'Agendada');
+});
+test('leitura rápida atualiza horário de visita existente e preserva os dados do CRM',async()=>{
+ agendaFalsa([bruto('e1',{start:{dateTime:'2026-11-21T15:30:00-03:00'},end:{dateTime:'2026-11-21T16:30:00-03:00'}})]);
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita Jardins',bairro:'Centro',data:'2026-11-20',hora:'09:00',cliente:'Maria',status:'Agendada'}});
+ const r=await api.lerMudancasDaAgenda(db,'token',AGORA);const v=db.snapshot('visits/v1').data();
+ assert.equal(r.updated,1);assert.equal(v.data,'2026-11-21');assert.equal(v.hora,'15:30');assert.equal(v.cliente,'Maria');assert.equal((await db.collection('visits').get()).size,1);
+});
+test('leitura rápida não sobrescreve edição local pendente de envio',async()=>{
+ agendaFalsa([bruto('e1',{summary:'Visita mudada no Google'})]);
+ const db=new MemoryDB({'visits/v1':{sourceId:'e1',calendarId:'c1',imovel:'Visita editada no CRM',data:'2026-11-20',pendingGoogleSync:true}});
+ const r=await api.lerMudancasDaAgenda(db,'token',AGORA);assert.equal(r.updated,0);assert.equal(db.snapshot('visits/v1').data().imovel,'Visita editada no CRM');
+});
+test('leitura rápida ignora evento cancelado, evento que não é visita e pedido de exclusão',async()=>{
+ agendaFalsa([{id:'apagado',status:'cancelled'},bruto('reuniao',{summary:'Reunião'}),bruto('excluir1')]);
+ const db=new MemoryDB({['googleDeletions/'+api.importedVisitId('c1','excluir1')]:{sourceId:'excluir1',calendarId:'c1'}});
+ const r=await api.lerMudancasDaAgenda(db,'token',AGORA,{pendentesIds:new Set([api.eventKey('c1','excluir1')])});
+ assert.equal(r.imported,0);assert.equal((await db.collection('visits').get()).size,0);
+});
+test('leitura rápida reaproveita a agenda já lida no disparo e filtra pela data de alteração',async()=>{
+ let chamadas=0;mockFetch(async()=>{chamadas++;return response({})});const db=new MemoryDB();
+ const ev=(id,updated)=>({id,calendarId:'c1',titulo:'Visita '+id,data:'2026-11-20',local:'',descricao:'',raw:{start:{date:'2026-11-20'},end:{date:'2026-11-21'},updated}});
+ const r=await api.lerMudancasDaAgenda(db,'token',AGORA,{eventosDaAgenda:[ev('velho','2026-11-13T11:00:00Z'),ev('novo','2026-11-13T12:01:00Z')]});
+ assert.equal(chamadas,0);assert.equal(r.eventos,1);assert.equal(r.imported,1);assert.equal(db.snapshot('visits/'+api.importedVisitId('c1','novo')).exists,true);assert.equal(db.snapshot('visits/'+api.importedVisitId('c1','velho')).exists,false);
 });
