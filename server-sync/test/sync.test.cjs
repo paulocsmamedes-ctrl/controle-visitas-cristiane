@@ -282,7 +282,7 @@ test('importação traz o horário do Google para o campo do formulário',async(
 const AGORA=Date.parse('2026-11-13T12:00:00Z');
 function agendaFalsa(items,vistos=[]){mockFetch(async url=>{const u=new URL(url);if(u.pathname.endsWith('/calendarList'))return response({items:[{id:'c1',primary:true}]});vistos.push(u.searchParams.get('updatedMin'));return response({items})})}
 function contarLeiturasInteiras(db){const cont={n:0};const orig=db.collection.bind(db);db.collection=name=>{const c=orig(name);const g=c.get;c.get=()=>{cont.n++;return g()};return c};return cont}
-const bruto=(id,extra={})=>({id,summary:'Visita Jardins',location:'Centro',start:{dateTime:'2026-11-20T09:00:00-03:00'},end:{dateTime:'2026-11-20T10:00:00-03:00'},updated:'2026-11-13T12:03:00Z',...extra});
+const bruto=(id,extra={})=>({id,summary:'Visita Jardins',location:'Centro',start:{dateTime:'2099-11-20T09:00:00-03:00'},end:{dateTime:'2099-11-20T10:00:00-03:00'},updated:'2026-11-13T12:03:00Z',...extra});
 test('leitura rápida pede ao Google só o que mudou desde o último completo (com margem)',async()=>{
  const vistos=[];agendaFalsa([],vistos);const db=new MemoryDB();
  const r=await api.lerMudancasDaAgenda(db,'token',AGORA);
@@ -296,7 +296,7 @@ test('leitura rápida importa visita nova sem reler a coleção inteira',async()
  agendaFalsa([bruto('novo1')]);const db=new MemoryDB({'visits/v1':{sourceId:'outro',calendarId:'c1',imovel:'Visita antiga'}});const cont=contarLeiturasInteiras(db);
  const r=await api.lerMudancasDaAgenda(db,'token',AGORA);
  assert.equal(r.imported,1);assert.equal(cont.n,0);assert.equal(db.consultas.length,1);assert.match(db.consultas[0],/^visits:sourceIdin/);
- const nova=db.snapshot('visits/'+api.importedVisitId('c1','novo1')).data();assert.equal(nova.imovel,'Visita Jardins');assert.equal(nova.data,'2026-11-20');assert.equal(nova.hora,'09:00');assert.equal(nova.status,'Agendada');
+ const nova=db.snapshot('visits/'+api.importedVisitId('c1','novo1')).data();assert.equal(nova.imovel,'Visita Jardins');assert.equal(nova.data,'2099-11-20');assert.equal(nova.hora,'09:00');assert.equal(nova.status,'Agendada');
 });
 test('leitura rápida atualiza horário de visita existente e preserva os dados do CRM',async()=>{
  agendaFalsa([bruto('e1',{start:{dateTime:'2026-11-21T15:30:00-03:00'},end:{dateTime:'2026-11-21T16:30:00-03:00'}})]);
